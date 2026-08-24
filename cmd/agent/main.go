@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/SakuraOpenSource/virtualis-agent/internal/driver"
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
@@ -36,6 +38,7 @@ type agentServer struct {
 	registry  *driver.Registry
 	mu        sync.RWMutex
 	instances map[uint]protocol.Instance
+	metrics   map[uint]protocol.Metrics
 }
 
 func newAgentServer(token, name, version, dataDir string) *agentServer {
@@ -46,6 +49,7 @@ func newAgentServer(token, name, version, dataDir string) *agentServer {
 		dataDir:   dataDir,
 		registry:  driver.NewRegistry(),
 		instances: make(map[uint]protocol.Instance),
+		metrics:   make(map[uint]protocol.Metrics),
 	}
 }
 
@@ -164,6 +168,14 @@ func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
 		s.powerInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "status":
 		s.statusInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "metrics":
+		s.metricsInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "network":
+		s.networkInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "vnc":
+		s.vncInstance(w, r, id)
+	case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "vnc" && parts[2] == "ws":
+		s.vncWebSocket(w, r, id)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -269,6 +281,192 @@ func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id 
 	s.instances[id] = instance
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
+}
+
+func (s *agentServer) metricsInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, err := s.requestInstance(r, id)
+	if err != nil {
+		instance, err = s.storedInstance(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	metrics, err := d.Metrics(r.Context(), &instance)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	metrics = s.addBandwidthSample(id, metrics)
+	writeJSON(w, http.StatusOK, map[string]any{"metrics": metrics})
+}
+
+func (s *agentServer) addBandwidthSample(id uint, metrics protocol.Metrics) protocol.Metrics {
+	if metrics.CollectedAt.IsZero() {
+		metrics.CollectedAt = time.Now().UTC()
+	}
+	s.mu.Lock()
+	previous, exists := s.metrics[id]
+	s.metrics[id] = metrics
+	s.mu.Unlock()
+	if !exists {
+		return metrics
+	}
+	seconds := metrics.CollectedAt.Sub(previous.CollectedAt).Seconds()
+	if seconds <= 0 {
+		return metrics
+	}
+	if metrics.BandwidthRxBps == 0 && metrics.NetworkRxBytes >= previous.NetworkRxBytes {
+		metrics.BandwidthRxBps = float64(metrics.NetworkRxBytes-previous.NetworkRxBytes) / seconds
+	}
+	if metrics.BandwidthTxBps == 0 && metrics.NetworkTxBytes >= previous.NetworkTxBytes {
+		metrics.BandwidthTxBps = float64(metrics.NetworkTxBytes-previous.NetworkTxBytes) / seconds
+	}
+	return metrics
+}
+
+func (s *agentServer) networkInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, err := s.requestInstance(r, id)
+	if err != nil {
+		instance, err = s.storedInstance(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	network, err := d.Network(r.Context(), &instance)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"network": network})
+}
+
+func (s *agentServer) vncInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, err := s.requestInstance(r, id)
+	if err != nil {
+		instance, err = s.storedInstance(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	vnc, err := d.VNC(r.Context(), &instance, requestHost(r))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"vnc": vnc})
+}
+
+var vncUpgrader = websocket.Upgrader{
+	ReadBufferSize:  32 << 10,
+	WriteBufferSize: 32 << 10,
+	Subprotocols:    []string{"binary"},
+	CheckOrigin:     func(*http.Request) bool { return true },
+}
+
+func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, err := s.storedInstance(id)
+	if err != nil {
+		// The master supplies the identity in the query so VNC can still work
+		// immediately after an agent restart, before the in-memory map is rebuilt.
+		instance = protocol.Instance{ID: id, Name: r.URL.Query().Get("name"), Driver: r.URL.Query().Get("driver")}
+		if instance.Name == "" || instance.Driver == "" {
+			writeError(w, http.StatusBadRequest, "instance identity required")
+			return
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	vnc, err := d.VNC(r.Context(), &instance, "127.0.0.1")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !vnc.Available || vnc.Port == 0 {
+		writeError(w, http.StatusBadRequest, vnc.Message)
+		return
+	}
+	raw, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(vnc.Port)), 5*time.Second)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "连接 QEMU VNC 失败: "+err.Error())
+		return
+	}
+	defer raw.Close()
+	conn, err := vncUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.SetReadLimit(16 << 20)
+	result := make(chan error, 2)
+	go func() {
+		for {
+			_, reader, readErr := conn.NextReader()
+			if readErr != nil {
+				result <- readErr
+				return
+			}
+			if _, copyErr := io.Copy(raw, reader); copyErr != nil {
+				result <- copyErr
+				return
+			}
+		}
+	}()
+	go func() {
+		buffer := make([]byte, 32<<10)
+		for {
+			n, readErr := raw.Read(buffer)
+			if n > 0 {
+				writer, writeErr := conn.NextWriter(websocket.BinaryMessage)
+				if writeErr != nil {
+					result <- writeErr
+					return
+				}
+				if _, writeErr = writer.Write(buffer[:n]); writeErr == nil {
+					writeErr = writer.Close()
+				} else {
+					_ = writer.Close()
+				}
+				if writeErr != nil {
+					result <- writeErr
+					return
+				}
+			}
+			if readErr != nil {
+				result <- readErr
+				return
+			}
+		}
+	}()
+	<-result
+}
+
+func requestHost(r *http.Request) string {
+	host := r.Host
+	if value, _, err := net.SplitHostPort(host); err == nil {
+		return value
+	}
+	return host
 }
 
 func (s *agentServer) requestInstance(r *http.Request, id uint) (protocol.Instance, error) {

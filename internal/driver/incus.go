@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
@@ -46,7 +47,10 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 		}
 		args[1] = alias
 	}
-	return run(ctx, d.cli(), args...)
+	if err := run(ctx, d.cli(), args...); err != nil {
+		return err
+	}
+	return configureIncusNetwork(ctx, d.cli(), name, inst.Network)
 }
 
 func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
@@ -94,4 +98,84 @@ func (d *Incus) Status(ctx context.Context, inst *protocol.Instance) (string, er
 		return StatusRunning, nil
 	}
 	return StatusStopped, nil
+}
+
+func (d *Incus) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
+	metrics := collectHostMetrics(inst)
+	name := resourceName("incus", inst)
+	if out, err := output(ctx, d.cli(), "info", name, "--resources"); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			lower := strings.ToLower(strings.TrimSpace(line))
+			if strings.HasPrefix(lower, "memory:") && strings.Contains(lower, "used") {
+				// Incus output is human-readable; the configured total remains
+				// authoritative when the running value cannot be parsed safely.
+				metrics.MemoryUsedMB = parseMiB(lower)
+			}
+		}
+	}
+	return metrics, nil
+}
+
+func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
+	status := collectHostNetwork(ctx, inst.Network)
+	name := resourceName("incus", inst)
+	if out, err := output(ctx, d.cli(), "exec", name, "--", "ip", "-o", "addr", "show"); err == nil {
+		guest := parseIPCommand(string(out))
+		if len(guest) > 0 {
+			status.Interfaces = guest
+			status.Reachable = true
+			status.Error = ""
+		}
+	}
+	return status, nil
+}
+
+func (d *Incus) VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error) {
+	return unsupportedVNC("incus")
+}
+
+func parseMiB(line string) int64 {
+	fields := strings.Fields(line)
+	for _, field := range fields {
+		field = strings.TrimSuffix(strings.TrimSuffix(field, "MiB"), "MB")
+		if value, err := strconv.ParseInt(field, 10, 64); err == nil {
+			return value
+		}
+	}
+	return 0
+}
+
+func configureIncusNetwork(ctx context.Context, cli, name string, network protocol.NetworkConfig) error {
+	mode := strings.ToLower(strings.TrimSpace(network.Mode))
+	if mode == "none" {
+		return run(ctx, cli, "config", "device", "remove", name, "eth0")
+	}
+	if mode == "bridge" && network.Bridge != "" {
+		if err := run(ctx, cli, "config", "device", "set", name, "eth0", "nictype", "bridged"); err != nil {
+			return err
+		}
+		if err := run(ctx, cli, "config", "device", "set", name, "eth0", "parent", network.Bridge); err != nil {
+			return err
+		}
+	}
+	if network.MAC != "" {
+		if err := run(ctx, cli, "config", "device", "set", name, "eth0", "hwaddr", network.MAC); err != nil {
+			return err
+		}
+	}
+	if network.IPv4 != "" {
+		if err := run(ctx, cli, "config", "device", "set", name, "eth0", "ipv4.address", network.IPv4); err != nil {
+			return err
+		}
+	}
+	if network.BandwidthMbps > 0 {
+		limit := fmt.Sprintf("%dMbit", network.BandwidthMbps)
+		if err := run(ctx, cli, "config", "device", "set", name, "eth0", "limits.ingress", limit); err != nil {
+			return err
+		}
+		if err := run(ctx, cli, "config", "device", "set", name, "eth0", "limits.egress", limit); err != nil {
+			return err
+		}
+	}
+	return nil
 }

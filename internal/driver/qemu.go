@@ -4,17 +4,31 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
 
-type QEMU struct{}
+type QEMU struct {
+	mu      sync.Mutex
+	samples map[uint]qemuSample
+}
 
-func NewQEMU() *QEMU         { return &QEMU{} }
+type qemuSample struct {
+	cpuTime uint64
+	rxBytes uint64
+	txBytes uint64
+	at      time.Time
+}
+
+func NewQEMU() *QEMU         { return &QEMU{samples: make(map[uint]qemuSample)} }
 func (d *QEMU) Name() string { return "qemu" }
 
 func (d *QEMU) Probe(_ context.Context) error {
@@ -84,6 +98,9 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 	if err := run(ctx, "virsh", "undefine", name, "--remove-all-storage"); err != nil && !contains(err.Error(), "not found") {
 		return err
 	}
+	d.mu.Lock()
+	delete(d.samples, inst.ID)
+	d.mu.Unlock()
 	return nil
 }
 
@@ -127,6 +144,191 @@ func (d *QEMU) Status(ctx context.Context, inst *protocol.Instance) (string, err
 	return StatusStopped, nil
 }
 
+func (d *QEMU) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
+	out, err := output(ctx, "virsh", "domstats", resourceName("qemu", inst), "--vcpu", "--balloon", "--interface")
+	if err != nil {
+		return protocol.Metrics{}, err
+	}
+	values := parseKeyValues(string(out))
+	metrics := defaultMetrics(inst)
+	metrics.CollectedAt = time.Now().UTC()
+	metrics.MemoryUsedMB = int64(values["balloon.current"] / 1024)
+	if metrics.MemoryTotalMB == 0 {
+		metrics.MemoryTotalMB = int64(inst.Spec.MemoryMB)
+	}
+	var cpuTime uint64
+	var rxBytes, txBytes uint64
+	for key, value := range values {
+		if strings.HasSuffix(key, ".time") {
+			cpuTime += value
+		}
+		if strings.HasSuffix(key, ".rx.bytes") {
+			rxBytes += value
+		}
+		if strings.HasSuffix(key, ".tx.bytes") {
+			txBytes += value
+		}
+	}
+	metrics.NetworkRxBytes = rxBytes
+	metrics.NetworkTxBytes = txBytes
+	d.mu.Lock()
+	previous, ok := d.samples[inst.ID]
+	d.samples[inst.ID] = qemuSample{cpuTime: cpuTime, rxBytes: rxBytes, txBytes: txBytes, at: metrics.CollectedAt}
+	d.mu.Unlock()
+	if ok {
+		seconds := metrics.CollectedAt.Sub(previous.at).Seconds()
+		if seconds > 0 {
+			if cpuTime >= previous.cpuTime {
+				cores := inst.Spec.CPU
+				if cores < 1 {
+					cores = 1
+				}
+				metrics.CPUPercent = float64(cpuTime-previous.cpuTime) / (seconds * 1e9 * float64(cores)) * 100
+			}
+			if rxBytes >= previous.rxBytes {
+				metrics.BandwidthRxBps = float64(rxBytes-previous.rxBytes) / seconds
+			}
+			if txBytes >= previous.txBytes {
+				metrics.BandwidthTxBps = float64(txBytes-previous.txBytes) / seconds
+			}
+		}
+	}
+	if metrics.CPUPercent < 0 {
+		metrics.CPUPercent = 0
+	}
+	if metrics.CPUPercent > 100 {
+		metrics.CPUPercent = 100
+	}
+	return metrics, nil
+}
+
+func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
+	name := resourceName("qemu", inst)
+	status := protocol.NetworkStatus{CheckedAt: time.Now().UTC()}
+	if out, err := output(ctx, "virsh", "domiflist", name); err == nil {
+		status.Interfaces = parseQEMUInterfaces(string(out))
+	}
+	ipOutput, ipErr := output(ctx, "virsh", "domifaddr", name, "--source", "agent")
+	if ipErr != nil {
+		ipOutput, _ = output(ctx, "virsh", "domifaddr", name, "--source", "lease")
+	}
+	if len(ipOutput) > 0 {
+		ips := parseQEMUIPs(string(ipOutput))
+		for i := range ips {
+			if i < len(status.Interfaces) {
+				status.Interfaces[i].IPv4 = append(status.Interfaces[i].IPv4, ips[i])
+			}
+		}
+	}
+	for i := range status.Interfaces {
+		if out, err := output(ctx, "virsh", "domifstat", name, status.Interfaces[i].Name); err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) != 2 {
+					continue
+				}
+				value, parseErr := strconv.ParseUint(fields[1], 10, 64)
+				if parseErr != nil {
+					continue
+				}
+				switch fields[0] {
+				case "rx_bytes":
+					status.Interfaces[i].RxBytes = value
+				case "tx_bytes":
+					status.Interfaces[i].TxBytes = value
+				}
+			}
+		}
+	}
+	if len(status.Interfaces) > 0 {
+		status.Reachable = false
+		for _, item := range status.Interfaces {
+			if len(item.IPv4) > 0 || len(item.IPv6) > 0 {
+				status.Reachable = true
+				break
+			}
+		}
+	} else {
+		status.Error = "未找到虚拟网卡或虚拟机尚未启动"
+	}
+	return status, nil
+}
+
+func (d *QEMU) VNC(ctx context.Context, inst *protocol.Instance, host string) (protocol.VNCInfo, error) {
+	out, err := output(ctx, "virsh", "vncdisplay", resourceName("qemu", inst))
+	if err != nil {
+		return protocol.VNCInfo{Available: false, Message: "实例尚未启用 VNC 或尚未启动"}, nil
+	}
+	display := strings.TrimSpace(string(out))
+	port := 0
+	if strings.HasPrefix(display, ":") {
+		n, parseErr := strconv.Atoi(strings.TrimPrefix(display, ":"))
+		if parseErr == nil {
+			port = 5900 + n
+		}
+	} else if _, portText, splitErr := net.SplitHostPort(display); splitErr == nil {
+		value, _ := strconv.Atoi(portText)
+		if value >= 0 && value < 100 {
+			port = 5900 + value
+		} else {
+			port = value
+		}
+	}
+	if port == 0 {
+		return protocol.VNCInfo{Available: false, Display: display, Message: "无法解析 VNC 端口"}, nil
+	}
+	host = strings.TrimSpace(host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return protocol.VNCInfo{Available: true, Protocol: "vnc", Host: host, Port: port, Display: display, URL: fmt.Sprintf("vnc://%s:%d", host, port)}, nil
+}
+
+func parseKeyValues(text string) map[string]uint64 {
+	values := make(map[string]uint64)
+	for _, line := range strings.Split(text, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
+		if err == nil {
+			values[strings.TrimSpace(parts[0])] = value
+		}
+	}
+	return values
+}
+
+func parseQEMUInterfaces(text string) []protocol.NetworkInterface {
+	var result []protocol.NetworkInterface
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] == "Interface" || strings.HasPrefix(fields[0], "-") {
+			continue
+		}
+		result = append(result, protocol.NetworkInterface{Name: fields[0], State: "up", MAC: fields[len(fields)-1]})
+	}
+	return result
+}
+
+func parseQEMUIPs(text string) []string {
+	var result []string
+	for _, line := range strings.Split(text, "\n") {
+		for _, field := range strings.Fields(line) {
+			if strings.Contains(field, "/") {
+				value := strings.Split(field, "/")[0]
+				if ip := net.ParseIP(value); ip != nil {
+					result = append(result, value)
+				}
+			}
+		}
+	}
+	return result
+}
+
 func (d *QEMU) action(ctx context.Context, action string, inst *protocol.Instance, ignored ...string) error {
 	err := run(ctx, "virsh", action, resourceName("qemu", inst))
 	if err == nil {
@@ -166,8 +368,32 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
 	if isoPath != "" {
 		fmt.Fprintf(&b, "<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='%s'/><target dev='sda' bus='sata'/><readonly/></disk>", html.EscapeString(isoPath))
 	}
-	b.WriteString("<interface type='user'><model type='virtio'/></interface><console type='pty'/></devices></domain>")
+	b.WriteString(networkXML(inst.Network))
+	b.WriteString("<graphics type='vnc' autoport='yes' listen='0.0.0.0'/><console type='pty'/></devices></domain>")
 	return b.String()
+}
+
+func networkXML(network protocol.NetworkConfig) string {
+	mode := strings.ToLower(strings.TrimSpace(network.Mode))
+	if mode == "none" {
+		return ""
+	}
+	interfaceType := "network"
+	source := "<source network='default'/>"
+	if mode == "bridge" && network.Bridge != "" {
+		interfaceType = "bridge"
+		source = fmt.Sprintf("<source bridge='%s'/>", html.EscapeString(network.Bridge))
+	}
+	mac := ""
+	if parsed, err := net.ParseMAC(network.MAC); err == nil && len(parsed) == 6 {
+		mac = fmt.Sprintf("<mac address='%s'/>", html.EscapeString(parsed.String()))
+	}
+	bandwidth := ""
+	if network.BandwidthMbps > 0 {
+		average := network.BandwidthMbps * 1000
+		bandwidth = fmt.Sprintf("<bandwidth><inbound average='%d'/><outbound average='%d'/></bandwidth>", average, average)
+	}
+	return fmt.Sprintf("<interface type='%s'>%s%s<model type='virtio'/>%s</interface>", interfaceType, source, mac, bandwidth)
 }
 
 func contains(s, part string) bool {

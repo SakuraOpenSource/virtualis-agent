@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
@@ -30,9 +32,15 @@ func (d *LXC) Create(ctx context.Context, inst *protocol.Instance) error {
 			// A local LXC tarball is accepted by the local template when present.
 			args = []string{"-n", name, "-t", "local", "--", "-f", inst.Image.Path}
 		}
-		return run(ctx, "lxc-create", args...)
+		if err := run(ctx, "lxc-create", args...); err != nil {
+			return err
+		}
+		return configureLXCNetwork(name, inst.Network)
 	}
-	return run(ctx, "lxc", "create", name)
+	if err := run(ctx, "lxc", "create", name); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (d *LXC) Delete(ctx context.Context, inst *protocol.Instance) error {
@@ -111,9 +119,76 @@ func (d *LXC) Status(ctx context.Context, inst *protocol.Instance) (string, erro
 	return StatusRunning, nil
 }
 
+func (d *LXC) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
+	metrics := collectHostMetrics(inst)
+	// LXC exposes cgroup counters differently across cgroup v1/v2 and distro
+	// versions. Return the configured memory and live network counters while
+	// leaving unavailable container CPU counters explicit as zero.
+	_ = ctx
+	return metrics, nil
+}
+
+func (d *LXC) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
+	status := collectHostNetwork(ctx, inst.Network)
+	name := resourceName("lxc", inst)
+	if hasCommand("lxc-attach") {
+		if out, err := output(ctx, "lxc-attach", "-n", name, "--", "ip", "-o", "addr", "show"); err == nil {
+			guest := parseIPCommand(string(out))
+			if len(guest) > 0 {
+				status.Interfaces = guest
+				status.Reachable = true
+				status.Error = ""
+			}
+		}
+	} else if out, err := output(ctx, "lxc-info", "-n", name, "-iH"); err == nil {
+		ip := strings.TrimSpace(string(out))
+		if ip != "" {
+			status.Interfaces = []protocol.NetworkInterface{{Name: "eth0", State: "up", IPv4: []string{ip}}}
+			status.Reachable = true
+			status.Error = ""
+		}
+	}
+	return status, nil
+}
+
+func (d *LXC) VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error) {
+	return unsupportedVNC("lxc")
+}
+
 func lxcArch(arch string) string {
 	if strings.EqualFold(arch, "arm64") || strings.EqualFold(arch, "aarch64") {
 		return "arm64"
 	}
 	return "amd64"
+}
+
+func configureLXCNetwork(name string, network protocol.NetworkConfig) error {
+	if strings.EqualFold(network.Mode, "none") {
+		return nil
+	}
+	path := filepath.Join("/var/lib/lxc", name, "config")
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+	bridge := network.Bridge
+	if bridge == "" {
+		bridge = "lxcbr0"
+	}
+	lines := []string{"", "# Virtualis network", "lxc.net.0.type = veth", "lxc.net.0.link = " + bridge}
+	if network.MAC != "" {
+		lines = append(lines, "lxc.net.0.hwaddr = "+network.MAC)
+	}
+	if network.IPv4 != "" {
+		lines = append(lines, "lxc.net.0.ipv4.address = "+network.IPv4)
+	}
+	if network.Gateway != "" {
+		lines = append(lines, "lxc.net.0.ipv4.gateway = "+network.Gateway)
+	}
+	_, err = file.WriteString(strings.Join(lines, "\n") + "\n")
+	return err
 }

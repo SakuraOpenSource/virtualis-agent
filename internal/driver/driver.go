@@ -30,6 +30,9 @@ type Driver interface {
 	HardRestart(context.Context, *protocol.Instance) error
 	Reinstall(context.Context, *protocol.Instance) error
 	Status(context.Context, *protocol.Instance) (string, error)
+	Metrics(context.Context, *protocol.Instance) (protocol.Metrics, error)
+	Network(context.Context, *protocol.Instance) (protocol.NetworkStatus, error)
+	VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error)
 }
 
 type Capability struct {
@@ -233,6 +236,25 @@ func (m *Mock) Status(ctx context.Context, inst *protocol.Instance) (string, err
 		return StatusStopped, nil
 	}
 	return status, nil
+}
+func (m *Mock) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
+	if err := shortDelay(ctx); err != nil {
+		return protocol.Metrics{}, err
+	}
+	return defaultMetrics(inst), nil
+}
+func (m *Mock) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
+	if err := shortDelay(ctx); err != nil {
+		return protocol.NetworkStatus{}, err
+	}
+	status := collectHostNetwork(ctx, inst.Network)
+	if inst.Network.Mode == "" {
+		status.Reachable = true
+	}
+	return status, nil
+}
+func (m *Mock) VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error) {
+	return unsupportedVNC("mock")
 }
 func (m *Mock) set(ctx context.Context, id uint, status string) error {
 	if err := shortDelay(ctx); err != nil {
