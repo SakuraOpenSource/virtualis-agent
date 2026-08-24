@@ -1,102 +1,621 @@
 package main
 
 import (
-	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
+	goruntime "runtime"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/SakuraOpenSource/virtualis-agent/internal/driver"
+	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
+
+const maxImageSize = int64(64 << 30)
+
+type agentServer struct {
+	token     string
+	name      string
+	version   string
+	dataDir   string
+	registry  *driver.Registry
+	mu        sync.RWMutex
+	instances map[uint]protocol.Instance
+}
+
+func newAgentServer(token, name, version, dataDir string) *agentServer {
+	return &agentServer{
+		token:     token,
+		name:      name,
+		version:   version,
+		dataDir:   dataDir,
+		registry:  driver.NewRegistry(),
+		instances: make(map[uint]protocol.Instance),
+	}
+}
+
+func (s *agentServer) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/api/health", s.auth(http.HandlerFunc(s.health)))
+	mux.Handle("/api/drivers", s.auth(http.HandlerFunc(s.drivers)))
+	mux.Handle("/api/instances", s.auth(http.HandlerFunc(s.createInstance)))
+	mux.Handle("/api/instances/", s.auth(http.HandlerFunc(s.instanceRoute)))
+	return mux
+}
+
+func (s *agentServer) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provided := r.Header.Get("X-Agent-Token")
+		if provided == "" {
+			provided = r.URL.Query().Get("token")
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+			writeError(w, http.StatusUnauthorized, "agent token 无效")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *agentServer) health(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"name":    s.name,
+		"version": s.version,
+		"drivers": s.registry.Capabilities(r.Context()),
+	})
+}
+
+func (s *agentServer) drivers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.registry.Capabilities(r.Context())})
+}
+
+func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	instance, upload, filename, cleanup, err := parseInstance(r)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if instance.ID == 0 || strings.TrimSpace(instance.Name) == "" {
+		writeError(w, http.StatusBadRequest, "instance id/name required")
+		return
+	}
+	if instance.Image == nil && upload != nil {
+		instance.Image = &protocol.Image{OriginalName: filename, Driver: instance.Driver, Type: "disk"}
+	}
+	if upload != nil {
+		localPath, saveErr := s.saveImage(upload, filename)
+		if saveErr != nil {
+			writeError(w, http.StatusBadRequest, saveErr.Error())
+			return
+		}
+		if instance.Image == nil {
+			instance.Image = &protocol.Image{}
+		}
+		instance.Image.Path = localPath
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if d.Name() == "lxc" && instance.Type == "vm" {
+		writeError(w, http.StatusBadRequest, "LXC 只能创建容器")
+		return
+	}
+	if err := d.Create(r.Context(), &instance); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	instance.Driver = d.Name()
+	instance.Status = driver.StatusStopped
+	s.mu.Lock()
+	s.instances[instance.ID] = instance
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
+}
+
+func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/instances/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeError(w, http.StatusBadRequest, "instance id required")
+		return
+	}
+	var id uint
+	if _, err := fmt.Sscanf(parts[0], "%d", &id); err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest, "invalid instance id")
+		return
+	}
+	switch {
+	case r.Method == http.MethodDelete && len(parts) == 1:
+		s.deleteInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "power":
+		s.powerInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "status":
+		s.statusInstance(w, r, id)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, err := s.requestInstance(r, id)
+	if err != nil {
+		instance, err = s.storedInstance(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := d.Delete(r.Context(), &instance); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if instance.Image != nil && instance.Image.Path != "" {
+		_ = os.Remove(instance.Image.Path)
+	}
+	s.mu.Lock()
+	delete(s.instances, id)
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, action, upload, filename, cleanup, err := parsePower(r)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if instance.ID == 0 {
+		instance, err = s.storedInstance(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if instance.ID != id {
+		writeError(w, http.StatusBadRequest, "instance id mismatch")
+		return
+	}
+	if upload != nil {
+		localPath, saveErr := s.saveImage(upload, filename)
+		if saveErr != nil {
+			writeError(w, http.StatusBadRequest, saveErr.Error())
+			return
+		}
+		if instance.Image == nil {
+			instance.Image = &protocol.Image{Driver: instance.Driver, Type: "disk"}
+		}
+		instance.Image.Path = localPath
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := runAction(r.Context(), d, action, &instance); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	instance.Driver = d.Name()
+	instance.Status = statusForAction(action)
+	s.mu.Lock()
+	s.instances[id] = instance
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
+}
+
+func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	instance, err := s.requestInstance(r, id)
+	if err != nil {
+		instance, err = s.storedInstance(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status, err := d.Status(r.Context(), &instance)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	instance.Driver = d.Name()
+	instance.Status = status
+	s.mu.Lock()
+	s.instances[id] = instance
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
+}
+
+func (s *agentServer) requestInstance(r *http.Request, id uint) (protocol.Instance, error) {
+	var payload struct {
+		Instance protocol.Instance `json:"instance"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		return protocol.Instance{}, err
+	}
+	if payload.Instance.ID == 0 {
+		return protocol.Instance{}, errors.New("instance missing")
+	}
+	if payload.Instance.ID != id {
+		return protocol.Instance{}, errors.New("instance id mismatch")
+	}
+	return payload.Instance, nil
+}
+
+func (s *agentServer) storedInstance(id uint) (protocol.Instance, error) {
+	s.mu.RLock()
+	instance, ok := s.instances[id]
+	s.mu.RUnlock()
+	if !ok {
+		return protocol.Instance{}, errors.New("instance not found on agent")
+	}
+	return instance, nil
+}
+
+func (s *agentServer) saveImage(src io.Reader, filename string) (string, error) {
+	if err := os.MkdirAll(filepath.Join(s.dataDir, "images"), 0o700); err != nil {
+		return "", fmt.Errorf("创建镜像目录失败: %w", err)
+	}
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	ext := safeExtension(filename)
+	path := filepath.Join(s.dataDir, "images", hex.EncodeToString(raw)+ext)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	written, err := io.Copy(f, io.LimitReader(src, maxImageSize+1))
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if written > maxImageSize {
+		_ = os.Remove(path)
+		return "", errors.New("镜像文件超过 64 GiB")
+	}
+	return path, nil
+}
+
+func safeExtension(filename string) string {
+	name := strings.ToLower(filepath.Base(filename))
+	for _, ext := range []string{".tar.gz", ".qcow2", ".vmdk", ".vdi", ".raw", ".img", ".iso", ".gz"} {
+		if strings.HasSuffix(name, ext) {
+			return ext
+		}
+	}
+	return ""
+}
+
+func parseInstance(r *http.Request) (protocol.Instance, io.Reader, string, func(), error) {
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			return protocol.Instance{}, nil, "", nil, err
+		}
+		var instance protocol.Instance
+		if err := json.Unmarshal([]byte(r.FormValue("instance")), &instance); err != nil {
+			return protocol.Instance{}, nil, "", cleanupMultipart(r), err
+		}
+		file, header, err := r.FormFile("image")
+		if err != nil {
+			return instance, nil, "", cleanupMultipart(r), nil
+		}
+		return instance, file, header.Filename, func() { file.Close(); cleanupMultipart(r) }, nil
+	}
+	var payload struct {
+		Instance protocol.Instance `json:"instance"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		return protocol.Instance{}, nil, "", nil, err
+	}
+	return payload.Instance, nil, "", nil, nil
+}
+
+func parsePower(r *http.Request) (protocol.Instance, string, io.Reader, string, func(), error) {
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			return protocol.Instance{}, "", nil, "", nil, err
+		}
+		var payload struct {
+			Action   string            `json:"action"`
+			Instance protocol.Instance `json:"instance"`
+		}
+		if err := json.Unmarshal([]byte(r.FormValue("power")), &payload); err != nil {
+			return protocol.Instance{}, "", nil, "", cleanupMultipart(r), err
+		}
+		file, header, err := r.FormFile("image")
+		if err != nil {
+			return payload.Instance, payload.Action, nil, "", cleanupMultipart(r), nil
+		}
+		return payload.Instance, payload.Action, file, header.Filename, func() { file.Close(); cleanupMultipart(r) }, nil
+	}
+	var payload struct {
+		Action   string            `json:"action"`
+		Instance protocol.Instance `json:"instance"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		return protocol.Instance{}, "", nil, "", nil, err
+	}
+	return payload.Instance, payload.Action, nil, "", nil, nil
+}
+
+func cleanupMultipart(r *http.Request) func() {
+	return func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}
+}
+
+func runAction(ctx context.Context, d driver.Driver, action string, instance *protocol.Instance) error {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "start":
+		return d.Start(ctx, instance)
+	case "stop":
+		return d.Stop(ctx, instance)
+	case "restart":
+		return d.Restart(ctx, instance)
+	case "hard_start":
+		return d.HardStart(ctx, instance)
+	case "hard_stop":
+		return d.HardStop(ctx, instance)
+	case "hard_restart":
+		return d.HardRestart(ctx, instance)
+	case "reinstall":
+		return d.Reinstall(ctx, instance)
+	default:
+		return fmt.Errorf("不支持的操作 %q", action)
+	}
+}
+
+func statusForAction(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "start", "restart", "hard_start", "hard_restart":
+		return driver.StatusRunning
+	default:
+		return driver.StatusStopped
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+type registration struct {
+	IP       string   `json:"ip"`
+	Endpoint string   `json:"endpoint"`
+	Driver   string   `json:"driver"`
+	Drivers  []string `json:"drivers"`
+	OS       string   `json:"os"`
+	Arch     string   `json:"arch"`
+	Version  string   `json:"version"`
+}
+
+func (s *agentServer) register(ctx context.Context, master, endpoint string) error {
+	items := s.registry.Capabilities(ctx)
+	drivers := make([]string, 0, len(items))
+	primary := ""
+	for _, item := range items {
+		if item.Available {
+			drivers = append(drivers, item.Name)
+			if primary == "" {
+				primary = item.Name
+			}
+		}
+	}
+	ip := endpointHost(endpoint)
+	payload := registration{IP: ip, Endpoint: endpoint, Driver: primary, Drivers: drivers, OS: goruntime.GOOS, Arch: goruntime.GOARCH, Version: s.version}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(master, "/")+"/api/agent/register", strings.NewReader(string(raw)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Token", s.token)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("主控拒绝注册 (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func endpointHost(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+func discoverEndpoint(advertise string, listen net.Addr, master string) (string, error) {
+	if advertise = strings.TrimRight(strings.TrimSpace(advertise), "/"); advertise != "" {
+		u, err := url.Parse(advertise)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return "", errors.New("--advertise 必须是 http:// 或 https:// 地址")
+		}
+		return advertise, nil
+	}
+	tcp, ok := listen.(*net.TCPAddr)
+	if !ok {
+		return "", errors.New("无法解析监听地址")
+	}
+	host := tcp.IP.String()
+	if tcp.IP == nil || tcp.IP.IsUnspecified() {
+		host = localAddress(master)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, fmt.Sprint(tcp.Port)), nil
+}
+
+func localAddress(master string) string {
+	u, err := url.Parse(master)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+	}
+	conn, err := net.DialTimeout("udp", net.JoinHostPort(u.Hostname(), port), 2*time.Second)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	addr, _ := net.ResolveUDPAddr("udp", conn.LocalAddr().String())
+	if addr == nil {
+		return ""
+	}
+	return addr.IP.String()
+}
 
 func main() {
 	var (
-		master  = flag.String("master", "", "主控地址，例如 http://MASTER_IP:8080")
-		token   = flag.String("token", "", "主控生成的接入 token")
-		name    = flag.String("name", "", "被控名称，如 node-01")
-		listen  = flag.String("listen", ":8081", "被控自身监听地址")
-		version = flag.String("version", "dev", "版本")
+		master    = flag.String("master", "", "主控地址，例如 http://MASTER:8080")
+		token     = flag.String("token", "", "主控生成的接入 token")
+		name      = flag.String("name", "", "被控名称")
+		listen    = flag.String("listen", ":8081", "被控 RPC 监听地址")
+		advertise = flag.String("advertise", "", "主控可访问的被控地址，例如 http://10.0.0.2:8081")
+		dataDir   = flag.String("data", "/var/lib/virtualis-agent", "被控数据目录")
+		version   = flag.String("version", "dev", "版本")
 	)
 	flag.Parse()
-
-	if *master == "" || *token == "" {
-		fmt.Println("用法: virtualis-agent --master http://MASTER:8080 --token <token> --name node-01 [--listen :8081]")
+	if strings.TrimSpace(*master) == "" || strings.TrimSpace(*token) == "" {
+		fmt.Println("用法: virtualis-agent --master http://MASTER:8080 --token TOKEN --name node-01 [--advertise http://AGENT:8081]")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
 	if *name == "" {
-		h, _ := os.Hostname()
-		if h == "" {
-			h = "agent"
+		*name, _ = os.Hostname()
+		if *name == "" {
+			*name = "agent"
 		}
-		*name = h
 	}
-
-	fmt.Printf("Virtualis Agent %s\n", *version)
-	fmt.Printf("主控: %s\n", *master)
-	fmt.Printf("名称: %s\n", *name)
-	fmt.Printf("监听: %s\n", *listen)
-
-	// 注册到主控
-	registerURL := fmt.Sprintf("%s/api/agent/register", *master)
-	payload := map[string]string{
-		"driver":  "mock",
-		"version": *version,
+	if err := os.MkdirAll(filepath.Join(*dataDir, "images"), 0o700); err != nil {
+		log.Fatalf("创建数据目录失败: %v", err)
 	}
-	raw, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", registerURL, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Agent-Token", *token)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	state := newAgentServer(*token, *name, *version, *dataDir)
+	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
-		log.Fatalf("注册失败: %v (请检查主控地址与 token)", err)
+		log.Fatalf("监听失败: %v", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		var body bytes.Buffer
-		body.ReadFrom(resp.Body)
-		log.Fatalf("主控拒绝注册 (%d): %s", resp.StatusCode, body.String())
+	endpoint, err := discoverEndpoint(*advertise, listener.Addr(), *master)
+	if err != nil {
+		listener.Close()
+		log.Fatal(err)
 	}
-	fmt.Println("✓ 已成功注册到主控")
-
-	// 心跳循环
+	httpServer := &http.Server{Handler: state.handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			hb, _ := http.NewRequest("POST", registerURL, bytes.NewReader(raw))
-			hb.Header.Set("Content-Type", "application/json")
-			hb.Header.Set("X-Agent-Token", *token)
-			resp, err := client.Do(hb)
-			if err != nil {
-				log.Printf("心跳失败: %v", err)
-				continue
-			}
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				log.Printf("心跳成功")
-			}
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("RPC 服务停止: %v", err)
 		}
 	}()
 
-	// 被控自身也提供与主控相同的 VM API（无前端），供主控转发调用
-	// 这里启动一个极简 HTTP 服务，复用 master 的驱动逻辑
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true,"name":"` + *name + `"}`))
-	})
-	mux.HandleFunc("/api/drivers", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"items":[{"name":"mock","available":true},{"name":"qemu","available":false},{"name":"lxc","available":false},{"name":"incus","available":false}]}`))
-	})
-	fmt.Printf("被控 HTTP 服务已启动 %s (健康检查: http://localhost%s/api/health)\n", *listen, *listen)
-	fmt.Println("保持运行中，按 Ctrl+C 退出")
-	if err := http.ListenAndServe(*listen, mux); err != nil {
-		log.Fatalf("监听失败: %v", err)
+	registerCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	err = state.register(registerCtx, *master, endpoint)
+	cancel()
+	if err != nil {
+		_ = httpServer.Shutdown(context.Background())
+		log.Fatalf("注册失败: %v", err)
 	}
+	log.Printf("Virtualis Agent %s online: name=%s endpoint=%s", *version, *name, endpoint)
+
+	ctx, stop := signalContext()
+	defer stop()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if err := state.register(heartbeatCtx, *master, endpoint); err != nil {
+				log.Printf("心跳失败: %v", err)
+			}
+			heartbeatCancel()
+		case <-ctx.Done():
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = httpServer.Shutdown(shutdownCtx)
+			shutdownCancel()
+			return
+		}
+	}
+}
+
+func signalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	// Keep the agent dependency-free while handling the common termination
+	// signals used by systemd, launchd, and Windows service wrappers.
+	go func() {
+		<-ch
+		cancel()
+	}()
+	// os/signal.Notify is isolated here to keep startup code readable.
+	// The channel is registered for SIGINT and SIGTERM on Unix; on Windows the
+	// runtime still delivers the interrupt signal.
+	signal.Notify(ch, os.Interrupt)
+	return ctx, cancel
 }
