@@ -42,6 +42,9 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 	if !hasCommand("virsh") {
 		return fmt.Errorf("virsh 未安装，无法创建 QEMU 实例")
 	}
+	if err := d.ensureNetwork(ctx, inst); err != nil {
+		return err
+	}
 	name := resourceName("qemu", inst)
 	if d.exists(ctx, name) {
 		return nil
@@ -105,6 +108,9 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 }
 
 func (d *QEMU) Start(ctx context.Context, inst *protocol.Instance) error {
+	if err := d.ensureNetwork(ctx, inst); err != nil {
+		return err
+	}
 	return d.action(ctx, "start", inst, "already active")
 }
 func (d *QEMU) Stop(ctx context.Context, inst *protocol.Instance) error {
@@ -345,6 +351,57 @@ func (d *QEMU) action(ctx context.Context, action string, inst *protocol.Instanc
 
 func (d *QEMU) exists(ctx context.Context, name string) bool {
 	return exec.CommandContext(ctx, "virsh", "dominfo", name).Run() == nil
+}
+
+func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error {
+	mode := strings.ToLower(strings.TrimSpace(inst.Network.Mode))
+	if mode == "none" || mode == "bridge" {
+		return nil
+	}
+	info, err := output(ctx, "virsh", "net-info", "default")
+	if err != nil {
+		xml := `<network>
+  <name>default</name>
+  <forward mode='nat'/>
+  <bridge name='virbr0' stp='on' delay='0'/>
+  <ip address='192.168.122.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.122.2' end='192.168.122.254'/>
+    </dhcp>
+  </ip>
+</network>
+`
+		tmp, createErr := os.CreateTemp("", "virtualis-default-network-*.xml")
+		if createErr != nil {
+			return fmt.Errorf("创建 libvirt default 网络配置失败: %w", createErr)
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		if _, writeErr := tmp.WriteString(xml); writeErr != nil {
+			tmp.Close()
+			return fmt.Errorf("写入 libvirt default 网络配置失败: %w", writeErr)
+		}
+		if closeErr := tmp.Close(); closeErr != nil {
+			return closeErr
+		}
+		if defineErr := run(ctx, "virsh", "net-define", tmpName); defineErr != nil && !contains(defineErr.Error(), "already exists") {
+			return fmt.Errorf("定义 libvirt default 网络失败: %w", defineErr)
+		}
+		info, err = output(ctx, "virsh", "net-info", "default")
+	}
+	if err != nil {
+		return fmt.Errorf("读取 libvirt default 网络失败: %w", err)
+	}
+	if contains(string(info), "active: yes") {
+		return nil
+	}
+	if err := run(ctx, "virsh", "net-start", "default"); err != nil && !contains(err.Error(), "already active") {
+		return fmt.Errorf("启动 libvirt default 网络失败: %w", err)
+	}
+	if err := run(ctx, "virsh", "net-autostart", "default"); err != nil && !contains(err.Error(), "already active") {
+		return fmt.Errorf("设置 libvirt default 网络开机启动失败: %w", err)
+	}
+	return nil
 }
 
 func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) string {
