@@ -433,7 +433,7 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
 		arch = "x86_64"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "<domain type='kvm'><name>%s</name><memory unit='MiB'>%d</memory><currentMemory unit='MiB'>%d</currentMemory><vcpu placement='static'>%d</vcpu><os><type arch='%s'>hvm</type></os><devices>", html.EscapeString(name), memory, memory, cpu, arch)
+	fmt.Fprintf(&b, "<domain type='kvm'><name>%s</name><memory unit='MiB'>%d</memory><currentMemory unit='MiB'>%d</currentMemory><vcpu placement='static'>%d</vcpu><os><type arch='%s'>hvm</type><boot dev='hd'/></os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices>", html.EscapeString(name), memory, memory, cpu, arch)
 	if diskPath != "" {
 		fmt.Fprintf(&b, "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='%s'/><target dev='vda' bus='virtio'/></disk>", html.EscapeString(diskPath))
 	}
