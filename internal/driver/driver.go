@@ -47,9 +47,13 @@ type Registry struct {
 }
 
 func NewRegistry() *Registry {
+	return NewRegistryWithDataDir("")
+}
+
+func NewRegistryWithDataDir(dataDir string) *Registry {
 	r := &Registry{drivers: make(map[string]Driver)}
 	r.Register(NewIncus())
-	r.Register(NewQEMU())
+	r.Register(NewQEMUWithDataDir(dataDir))
 	r.Register(NewLXC())
 	r.Register(NewMock())
 	return r

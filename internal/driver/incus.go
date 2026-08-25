@@ -29,8 +29,15 @@ func (d *Incus) cli() string {
 }
 
 func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
+	if inst.Image == nil || inst.Image.Path == "" {
+		return fmt.Errorf("Incus 离线模式需要先上传镜像到 data/images，请在镜像管理上传镜像后重试")
+	}
 	name := resourceName("incus", inst)
-	args := []string{"launch", "images:ubuntu/22.04", name}
+	alias := name + "-image"
+	if err := run(ctx, d.cli(), "image", "import", inst.Image.Path, alias); err != nil {
+		return fmt.Errorf("导入离线镜像失败: %w", err)
+	}
+	args := []string{"launch", alias, name}
 	if inst.Type == "vm" {
 		args = append(args, "--vm")
 	}
@@ -39,13 +46,6 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	}
 	if inst.Spec.MemoryMB > 0 {
 		args = append(args, "-c", fmt.Sprintf("limits.memory=%dMiB", inst.Spec.MemoryMB))
-	}
-	if inst.Image != nil && inst.Image.Path != "" {
-		alias := name + "-image"
-		if err := run(ctx, d.cli(), "image", "import", inst.Image.Path, alias); err != nil {
-			return err
-		}
-		args[1] = alias
 	}
 	if err := run(ctx, d.cli(), args...); err != nil {
 		return err

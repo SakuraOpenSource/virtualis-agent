@@ -19,6 +19,7 @@ import (
 type QEMU struct {
 	mu      sync.Mutex
 	samples map[uint]qemuSample
+	dataDir string
 }
 
 type qemuSample struct {
@@ -28,7 +29,21 @@ type qemuSample struct {
 	at      time.Time
 }
 
-func NewQEMU() *QEMU         { return &QEMU{samples: make(map[uint]qemuSample)} }
+func NewQEMU() *QEMU { return NewQEMUWithDataDir("") }
+
+func NewQEMUWithDataDir(dataDir string) *QEMU {
+	if dataDir == "" {
+		dataDir = "/var/lib/virtualis-agent"
+	}
+	return &QEMU{samples: make(map[uint]qemuSample), dataDir: dataDir}
+}
+
+func (d *QEMU) imagesDir() string {
+	if d.dataDir != "" {
+		return filepath.Join(d.dataDir, "images")
+	}
+	return "/var/lib/virtualis-agent/images"
+}
 func (d *QEMU) Name() string { return "qemu" }
 
 func (d *QEMU) Probe(_ context.Context) error {
@@ -49,7 +64,7 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 	if d.exists(ctx, name) {
 		return nil
 	}
-	diskPath := filepath.Join("/var/lib/virtualis-agent/images", name+".qcow2")
+	diskPath := filepath.Join(d.imagesDir(), name+".qcow2")
 	var isoPath string
 	if inst.Image != nil && inst.Image.Path != "" {
 		if strings.EqualFold(inst.Image.Type, "iso") {

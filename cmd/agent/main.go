@@ -47,7 +47,7 @@ func newAgentServer(token, name, version, dataDir string) *agentServer {
 		name:      name,
 		version:   version,
 		dataDir:   dataDir,
-		registry:  driver.NewRegistry(),
+		registry:  driver.NewRegistryWithDataDir(dataDir),
 		instances: make(map[uint]protocol.Instance),
 		metrics:   make(map[uint]protocol.Metrics),
 	}

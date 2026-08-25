@@ -25,13 +25,15 @@ func (d *LXC) Probe(_ context.Context) error {
 }
 
 func (d *LXC) Create(ctx context.Context, inst *protocol.Instance) error {
+	if inst.Image == nil || inst.Image.Path == "" {
+		return fmt.Errorf("LXC 离线模式需要先上传镜像到 data/images，请在镜像管理上传镜像后重试")
+	}
+	if !strings.EqualFold(inst.Image.Type, "disk") {
+		return fmt.Errorf("LXC 仅支持磁盘镜像类型")
+	}
 	name := resourceName("lxc", inst)
 	if hasCommand("lxc-create") {
-		args := []string{"-n", name, "-t", "download", "--", "-d", "ubuntu", "-r", "jammy", "-a", lxcArch(inst.Spec.Arch)}
-		if inst.Image != nil && inst.Image.Path != "" && strings.EqualFold(inst.Image.Type, "disk") {
-			// A local LXC tarball is accepted by the local template when present.
-			args = []string{"-n", name, "-t", "local", "--", "-f", inst.Image.Path}
-		}
+		args := []string{"-n", name, "-t", "local", "--", "-f", inst.Image.Path}
 		if err := run(ctx, "lxc-create", args...); err != nil {
 			return err
 		}
