@@ -16,6 +16,11 @@ import (
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
 
+// QEMU 驱动：经 libvirt（virsh）管理 KVM 虚拟机。
+//
+// 网络：NAT 模式自动确保 libvirt default NAT 网络存在（virbr0 + DHCP）；
+// 独立 IP 模式把网卡直接挂到主机网卡 —— 软件网桥用 bridge 型接口，
+// 物理网卡用 macvtap（direct/bridge），实例以自己的 MAC 出现在网段上。
 type QEMU struct {
 	mu      sync.Mutex
 	samples map[uint]qemuSample
@@ -39,11 +44,9 @@ func NewQEMUWithDataDir(dataDir string) *QEMU {
 }
 
 func (d *QEMU) imagesDir() string {
-	if d.dataDir != "" {
-		return filepath.Join(d.dataDir, "images")
-	}
-	return "/var/lib/virtualis-agent/images"
+	return filepath.Join(d.dataDir, "images")
 }
+
 func (d *QEMU) Name() string { return "qemu" }
 
 func (d *QEMU) Probe(_ context.Context) error {
@@ -53,6 +56,9 @@ func (d *QEMU) Probe(_ context.Context) error {
 	return nil
 }
 
+// Create 定义并准备虚拟机：确保网络就绪、准备系统盘（qcow2）与安装介质
+// （ISO 走 cdrom），最后生成 domain XML 写入 libvirt。启动由 Start 完成，
+// ISO 存在时从光驱优先引导。
 func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 	if !hasCommand("virsh") {
 		return fmt.Errorf("virsh 未安装，无法创建 QEMU 实例")
@@ -62,8 +68,11 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 	}
 	name := resourceName("qemu", inst)
 	if d.exists(ctx, name) {
+		// 幂等：重装/重复投递时已有的域直接复用，由调用方继续 Start。
 		return nil
 	}
+
+	// 系统盘：磁盘镜像直接挂为 vda；ISO 引导时新建空白 qcow2 承载系统。
 	diskPath := filepath.Join(d.imagesDir(), name+".qcow2")
 	var isoPath string
 	if inst.Image != nil && inst.Image.Path != "" {
@@ -73,25 +82,24 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 			diskPath = inst.Image.Path
 		}
 	}
-	if isoPath != "" || diskPath != "" {
-		if _, err := os.Stat(diskPath); os.IsNotExist(err) {
-			if err := os.MkdirAll(filepath.Dir(diskPath), 0o700); err != nil {
-				return fmt.Errorf("创建 QEMU 磁盘目录失败: %w", err)
-			}
-			if !hasCommand("qemu-img") {
-				return fmt.Errorf("qemu-img 未安装")
-			}
-			size := inst.Spec.DiskGB
-			if size < 1 {
-				size = 20
-			}
-			if err := run(ctx, "qemu-img", "create", "-f", "qcow2", diskPath, fmt.Sprintf("%dG", size)); err != nil {
-				return err
-			}
+	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(diskPath), 0o700); err != nil {
+			return fmt.Errorf("创建磁盘目录失败: %w", err)
+		}
+		if !hasCommand("qemu-img") {
+			return fmt.Errorf("qemu-img 未安装")
+		}
+		size := inst.Spec.DiskGB
+		if size < 1 {
+			size = 20
+		}
+		if err := run(ctx, "qemu-img", "create", "-f", "qcow2", diskPath, fmt.Sprintf("%dG", size)); err != nil {
+			return err
 		}
 	}
+
 	xml := domainXML(name, inst, diskPath, isoPath)
-	tmp, err := os.CreateTemp("", "virtualis-qemu-*.xml")
+	tmp, err := os.CreateTemp("", "virtualis-domain-*.xml")
 	if err != nil {
 		return err
 	}
@@ -113,7 +121,8 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 		return nil
 	}
 	_ = d.HardStop(ctx, inst)
-	if err := run(ctx, "virsh", "undefine", name, "--remove-all-storage"); err != nil && !contains(err.Error(), "not found") {
+	// --remove-all-storage 连同 qcow2 一起清理；镜像文件由上层按需删除。
+	if err := run(ctx, "virsh", "undefine", name, "--remove-all-storage", "--nvram"); err != nil && !contains(err.Error(), "not found") {
 		return err
 	}
 	d.mu.Lock()
@@ -159,7 +168,7 @@ func (d *QEMU) Status(ctx context.Context, inst *protocol.Instance) (string, err
 		return StatusStopped, nil
 	}
 	state := strings.ToLower(strings.TrimSpace(string(out)))
-	if strings.Contains(state, "running") {
+	if strings.Contains(state, "running") || strings.Contains(state, "paused") {
 		return StatusRunning, nil
 	}
 	return StatusStopped, nil
@@ -229,9 +238,12 @@ func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.N
 	if out, err := output(ctx, "virsh", "domiflist", name); err == nil {
 		status.Interfaces = parseQEMUInterfaces(string(out))
 	}
+	// IP 优先问 guest agent（qemu-guest-agent），不可用再回落 DHCP lease。
 	ipOutput, ipErr := output(ctx, "virsh", "domifaddr", name, "--source", "agent")
-	if ipErr != nil {
-		ipOutput, _ = output(ctx, "virsh", "domifaddr", name, "--source", "lease")
+	if ipErr != nil || !strings.Contains(string(ipOutput), "ipv4") {
+		if leaseOutput, leaseErr := output(ctx, "virsh", "domifaddr", name, "--source", "lease"); leaseErr == nil {
+			ipOutput = leaseOutput
+		}
 	}
 	if len(ipOutput) > 0 {
 		ips := parseQEMUIPs(string(ipOutput))
@@ -275,6 +287,8 @@ func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.N
 	return status, nil
 }
 
+// VNC 返回实例的 VNC 连接信息。libvirt autoport 分配端口，运行时用
+// virsh vncdisplay 查询；主程序经 WebSocket 反代连接，端口不对外暴露。
 func (d *QEMU) VNC(ctx context.Context, inst *protocol.Instance, host string) (protocol.VNCInfo, error) {
 	out, err := output(ctx, "virsh", "vncdisplay", resourceName("qemu", inst))
 	if err != nil {
@@ -368,11 +382,32 @@ func (d *QEMU) exists(ctx context.Context, name string) bool {
 	return exec.CommandContext(ctx, "virsh", "dominfo", name).Run() == nil
 }
 
+// ensureNetwork 保证所选网络模式的基础设施就绪。
+//
+// NAT：确保 libvirt default NAT 网络存在并启动（virbr0 + DHCP 段）。
+// 独立 IP：校验挂载目标（网卡/网桥）存在，且主机有至少 2 个 IPv4 地址 ——
+// 只有一个地址说明主机自身都不宽裕，不允许再往同一网段放独立 IP 实例。
+// 关闭：无事可做。
 func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error {
-	mode := strings.ToLower(strings.TrimSpace(inst.Network.Mode))
-	if mode == "none" || mode == "bridge" {
+	switch NormalizeNetworkMode(inst.Network.Mode) {
+	case NetworkModeNone:
+		return nil
+	case NetworkModeNat:
+		return d.ensureDefaultNetwork(ctx)
+	case NetworkModeDedicated:
+		if _, _, err := dedicatedTarget(inst.Network); err != nil {
+			return err
+		}
+		if !DedicatedReady() {
+			return fmt.Errorf("独立 IP 模式要求主机拥有至少 2 个 IPv4 地址，当前不满足")
+		}
 		return nil
 	}
+	return nil
+}
+
+// ensureDefaultNetwork 定义并启动 libvirt default NAT 网络（幂等）。
+func (d *QEMU) ensureDefaultNetwork(ctx context.Context) error {
 	info, err := output(ctx, "virsh", "net-info", "default")
 	if err != nil {
 		xml := `<network>
@@ -386,7 +421,7 @@ func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error
   </ip>
 </network>
 `
-		tmp, createErr := os.CreateTemp("", "virtualis-default-network-*.xml")
+		tmp, createErr := os.CreateTemp("", "virtualis-network-*.xml")
 		if createErr != nil {
 			return fmt.Errorf("创建 libvirt default 网络配置失败: %w", createErr)
 		}
@@ -419,6 +454,9 @@ func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error
 	return nil
 }
 
+// domainXML 生成 libvirt 域描述，设备模型对齐生产级 KVM 管理面的常用配置：
+// host-passthrough CPU、virtio 磁盘/网卡、guest agent 通道、VGA 显卡、
+// USB tablet（VNC 指针跟随）。ISO 存在时优先从光驱引导。
 func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) string {
 	memory := inst.Spec.MemoryMB
 	if memory < 128 {
@@ -433,41 +471,107 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
 		arch = "x86_64"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "<domain type='kvm'><name>%s</name><memory unit='MiB'>%d</memory><currentMemory unit='MiB'>%d</currentMemory><vcpu placement='static'>%d</vcpu><os><type arch='%s'>hvm</type><boot dev='hd'/></os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices>", html.EscapeString(name), memory, memory, cpu, arch)
+	fmt.Fprintf(&b, `<domain type='kvm'>
+  <name>%s</name>
+  <memory unit='MiB'>%d</memory>
+  <currentMemory unit='MiB'>%d</currentMemory>
+  <vcpu placement='static'>%d</vcpu>
+  <os>
+    <type arch='%s' machine='pc'>hvm</type>
+`, html.EscapeString(name), memory, memory, cpu, arch)
+	if isoPath != "" {
+		b.WriteString("    <boot dev='cdrom'/>\n")
+	}
+	b.WriteString("    <boot dev='hd'/>\n  </os>\n")
+	b.WriteString("  <features>\n    <acpi/>\n    <apic/>\n  </features>\n")
+	b.WriteString("  <cpu mode='host-passthrough' check='none'>\n    <cache mode='passthrough'/>\n  </cpu>\n")
+	b.WriteString(`  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+`)
+	b.WriteString("  <on_poweroff>destroy</on_poweroff>\n  <on_reboot>restart</on_reboot>\n  <on_crash>destroy</on_crash>\n")
+	b.WriteString("  <pm>\n    <suspend-to-mem enabled='no'/>\n    <suspend-to-disk enabled='no'/>\n  </pm>\n")
+	b.WriteString("  <devices>\n")
 	if diskPath != "" {
-		fmt.Fprintf(&b, "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='%s'/><target dev='vda' bus='virtio'/></disk>", html.EscapeString(diskPath))
+		fmt.Fprintf(&b, `    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' discard='unmap'/>
+      <source file='%s'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+`, html.EscapeString(diskPath))
 	}
 	if isoPath != "" {
-		fmt.Fprintf(&b, "<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='%s'/><target dev='sda' bus='sata'/><readonly/></disk>", html.EscapeString(isoPath))
+		fmt.Fprintf(&b, `    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='%s'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+`, html.EscapeString(isoPath))
 	}
-	b.WriteString(networkXML(inst.Network))
-	b.WriteString("<graphics type='vnc' autoport='yes' listen='0.0.0.0'/><console type='pty'/></devices></domain>")
+	b.WriteString(qemuInterfaceXML(inst.Network))
+	b.WriteString(`    <controller type='scsi' index='0' model='virtio-scsi'/>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <input type='tablet' bus='usb'/>
+    <video>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
+    </video>
+    <memballoon model='virtio'/>
+    <graphics type='vnc' autoport='yes' listen='0.0.0.0'/>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+  </devices>
+</domain>
+`)
 	return b.String()
 }
 
-func networkXML(network protocol.NetworkConfig) string {
-	mode := strings.ToLower(strings.TrimSpace(network.Mode))
-	if mode == "none" {
+// qemuInterfaceXML 按网络模式生成 <interface>。
+//
+// NAT：挂 libvirt default NAT 网络，DHCP 自动发地址。
+// 独立 IP：挂主机网桥（bridge 型）或物理网卡（macvtap direct/bridge），
+// 实例以自己的 MAC 直接出现在局域网，拿到独立 IP。
+// 关闭：不生成网卡。
+func qemuInterfaceXML(network protocol.NetworkConfig) string {
+	switch NormalizeNetworkMode(network.Mode) {
+	case NetworkModeNone:
 		return ""
+	case NetworkModeNat:
+		mac := macXML(network.MAC)
+		bandwidth := bandwidthXML(network.BandwidthMbps)
+		return fmt.Sprintf("    <interface type='network'>%s<source network='default'/>%s<model type='virtio'/></interface>\n", mac, bandwidth)
 	}
-	interfaceType := "network"
-	source := "<source network='default'/>"
-	if mode == "bridge" && network.Bridge != "" {
-		interfaceType = "bridge"
-		source = fmt.Sprintf("<source bridge='%s'/>", html.EscapeString(network.Bridge))
+	target, isBridge, err := dedicatedTarget(network)
+	if err != nil {
+		// Create 前的 ensureNetwork 已校验过；这里防御性降级为 NAT。
+		mac := macXML(network.MAC)
+		return fmt.Sprintf("    <interface type='network'><source network='default'/>%s<model type='virtio'/></interface>\n", mac)
 	}
-	mac := ""
-	if parsed, err := net.ParseMAC(network.MAC); err == nil && len(parsed) == 6 {
-		mac = fmt.Sprintf("<mac address='%s'/>", html.EscapeString(parsed.String()))
+	mac := macXML(network.MAC)
+	bandwidth := bandwidthXML(network.BandwidthMbps)
+	if isBridge {
+		return fmt.Sprintf("    <interface type='bridge'>%s<source bridge='%s'/>%s<model type='virtio'/></interface>\n", mac, html.EscapeString(target), bandwidth)
 	}
-	bandwidth := ""
-	if network.BandwidthMbps > 0 {
-		average := network.BandwidthMbps * 1000
-		bandwidth = fmt.Sprintf("<bandwidth><inbound average='%d'/><outbound average='%d'/></bandwidth>", average, average)
-	}
-	return fmt.Sprintf("<interface type='%s'>%s%s<model type='virtio'/>%s</interface>", interfaceType, source, mac, bandwidth)
+	return fmt.Sprintf("    <interface type='direct'>%s<source dev='%s' mode='bridge'/>%s<model type='virtio'/></interface>\n", mac, html.EscapeString(target), bandwidth)
 }
 
-func contains(s, part string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(part))
+func macXML(raw string) string {
+	parsed, err := net.ParseMAC(raw)
+	if err != nil || len(parsed) != 6 {
+		return ""
+	}
+	return fmt.Sprintf("<mac address='%s'/>", html.EscapeString(parsed.String()))
+}
+
+func bandwidthXML(mbps int) string {
+	if mbps <= 0 {
+		return ""
+	}
+	average := mbps * 1000
+	return fmt.Sprintf("<bandwidth><inbound average='%d' peak='%d'/><outbound average='%d' peak='%d'/></bandwidth>", average, average, average, average)
 }

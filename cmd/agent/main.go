@@ -57,6 +57,7 @@ func (s *agentServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/health", s.auth(http.HandlerFunc(s.health)))
 	mux.Handle("/api/drivers", s.auth(http.HandlerFunc(s.drivers)))
+	mux.Handle("/api/host/network", s.auth(http.HandlerFunc(s.hostNetwork)))
 	mux.Handle("/api/instances", s.auth(http.HandlerFunc(s.createInstance)))
 	mux.Handle("/api/instances/", s.auth(http.HandlerFunc(s.instanceRoute)))
 	return mux
@@ -95,6 +96,17 @@ func (s *agentServer) drivers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": s.registry.Capabilities(r.Context())})
+}
+
+// hostNetwork 返回主机网卡清单与 IPv4 总数。独立 IP 模式的可用性判断
+// （主机至少 2 个 IPv4）与挂载接口选择都以此为数据源。
+func (s *agentServer) hostNetwork(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	summary := driver.CollectHostNetwork()
+	writeJSON(w, http.StatusOK, map[string]any{"network": summary})
 }
 
 func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {

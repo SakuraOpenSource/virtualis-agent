@@ -10,6 +10,8 @@ import (
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
 
+// LXC 驱动（经典 lxc 工具链）：lxc-create 从本地磁盘模板创建，
+// 网络写入 /var/lib/lxc/<name>/config。
 type LXC struct{}
 
 func NewLXC() *LXC          { return &LXC{} }
@@ -33,16 +35,56 @@ func (d *LXC) Create(ctx context.Context, inst *protocol.Instance) error {
 	}
 	name := resourceName("lxc", inst)
 	if hasCommand("lxc-create") {
-		args := []string{"-n", name, "-t", "local", "--", "-f", inst.Image.Path}
-		if err := run(ctx, "lxc-create", args...); err != nil {
+		if err := run(ctx, "lxc-create", "-n", name, "-t", "local", "--", "-f", inst.Image.Path); err != nil {
 			return err
 		}
 		return configureLXCNetwork(name, inst.Network)
 	}
-	if err := run(ctx, "lxc", "create", name); err != nil {
+	return run(ctx, "lxc", "create", name)
+}
+
+// configureLXCNetwork 把网络配置追加到容器 config。
+//
+// NAT：veth 挂 lxcbr0，由宿主 dnsmasq 发地址，共享主机出口 IP。
+// 独立 IP：veth 挂指定网桥，静态下发 IPv4/网关；主机需有至少 2 个 IPv4。
+// 关闭：不写网络配置（使用镜像默认）。
+func configureLXCNetwork(name string, network protocol.NetworkConfig) error {
+	mode := NormalizeNetworkMode(network.Mode)
+	if mode == NetworkModeNone {
+		return nil
+	}
+	bridge := "lxcbr0"
+	if mode == NetworkModeDedicated {
+		target, _, err := dedicatedTarget(network)
+		if err != nil {
+			return err
+		}
+		if !DedicatedReady() {
+			return fmt.Errorf("独立 IP 模式要求主机拥有至少 2 个 IPv4 地址，当前不满足")
+		}
+		bridge = target
+	}
+	path := filepath.Join("/var/lib/lxc", name, "config")
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	return nil
+	defer file.Close()
+	lines := []string{"", "# Virtualis network", "lxc.net.0.type = veth", "lxc.net.0.link = " + bridge}
+	if network.MAC != "" {
+		lines = append(lines, "lxc.net.0.hwaddr = "+network.MAC)
+	}
+	if mode == NetworkModeDedicated && network.IPv4 != "" {
+		lines = append(lines, "lxc.net.0.ipv4.address = "+network.IPv4)
+	}
+	if mode == NetworkModeDedicated && network.Gateway != "" {
+		lines = append(lines, "lxc.net.0.ipv4.gateway = "+network.Gateway)
+	}
+	_, err = file.WriteString(strings.Join(lines, "\n") + "\n")
+	return err
 }
 
 func (d *LXC) Delete(ctx context.Context, inst *protocol.Instance) error {
@@ -122,10 +164,9 @@ func (d *LXC) Status(ctx context.Context, inst *protocol.Instance) (string, erro
 }
 
 func (d *LXC) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
+	// LXC 的 cgroup 计数在 cgroup v1/v2 与发行版之间差异很大，这里只给
+	// 配置内存与宿主侧网络计数，不伪造容器 CPU。
 	metrics := collectHostMetrics(inst)
-	// LXC exposes cgroup counters differently across cgroup v1/v2 and distro
-	// versions. Return the configured memory and live network counters while
-	// leaving unavailable container CPU counters explicit as zero.
 	_ = ctx
 	return metrics, nil
 }
@@ -153,44 +194,7 @@ func (d *LXC) Network(ctx context.Context, inst *protocol.Instance) (protocol.Ne
 	return status, nil
 }
 
+// VNC：LXC 容器无图形控制台。
 func (d *LXC) VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error) {
 	return unsupportedVNC("lxc")
-}
-
-func lxcArch(arch string) string {
-	if strings.EqualFold(arch, "arm64") || strings.EqualFold(arch, "aarch64") {
-		return "arm64"
-	}
-	return "amd64"
-}
-
-func configureLXCNetwork(name string, network protocol.NetworkConfig) error {
-	if strings.EqualFold(network.Mode, "none") {
-		return nil
-	}
-	path := filepath.Join("/var/lib/lxc", name, "config")
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	defer file.Close()
-	bridge := network.Bridge
-	if bridge == "" {
-		bridge = "lxcbr0"
-	}
-	lines := []string{"", "# Virtualis network", "lxc.net.0.type = veth", "lxc.net.0.link = " + bridge}
-	if network.MAC != "" {
-		lines = append(lines, "lxc.net.0.hwaddr = "+network.MAC)
-	}
-	if network.IPv4 != "" {
-		lines = append(lines, "lxc.net.0.ipv4.address = "+network.IPv4)
-	}
-	if network.Gateway != "" {
-		lines = append(lines, "lxc.net.0.ipv4.gateway = "+network.Gateway)
-	}
-	_, err = file.WriteString(strings.Join(lines, "\n") + "\n")
-	return err
 }

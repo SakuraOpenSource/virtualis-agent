@@ -17,6 +17,8 @@ const (
 	StatusStopped = "stopped"
 )
 
+// Driver 是被控上的虚拟化后端抽象。所有实现都必须无状态、可并发使用：
+// 实例清单在主控落库，被控只按请求操作本机资源。
 type Driver interface {
 	Name() string
 	Probe(context.Context) error
@@ -41,21 +43,19 @@ type Capability struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// Registry 按名字管理驱动，并支持 auto 时按 Probe 顺序自动选择。
 type Registry struct {
 	mu      sync.RWMutex
 	drivers map[string]Driver
 }
 
-func NewRegistry() *Registry {
-	return NewRegistryWithDataDir("")
-}
-
+// NewRegistryWithDataDir 注册全部真实驱动：incus、qemu、lxc。
+// dataDir 是被控数据目录，驱动把磁盘与镜像放在 <dataDir>/images 下。
 func NewRegistryWithDataDir(dataDir string) *Registry {
 	r := &Registry{drivers: make(map[string]Driver)}
 	r.Register(NewIncus())
 	r.Register(NewQEMUWithDataDir(dataDir))
 	r.Register(NewLXC())
-	r.Register(NewMock())
 	return r
 }
 
@@ -96,13 +96,13 @@ func driverRank(name string) int {
 		return 1
 	case "lxc":
 		return 2
-	case "mock":
-		return 3
 	default:
 		return 99
 	}
 }
 
+// Resolve 选出要用的驱动：显式指定时必须已注册且可用；auto 时按
+// incus → qemu → lxc 顺序 Probe，取第一个可用的。
 func (r *Registry) Resolve(ctx context.Context, preferred string) (Driver, error) {
 	preferred = strings.ToLower(strings.TrimSpace(preferred))
 	if preferred != "" && preferred != "auto" {
@@ -159,6 +159,8 @@ func hasCommand(name string) bool {
 	return err == nil
 }
 
+// resourceName 是实例在本机的资源名（域名/容器名），主键 ID 保证唯一，
+// 展示名清洗后拼在后面便于管理员在 virsh/incus 里辨认。
 func resourceName(prefix string, inst *protocol.Instance) string {
 	return fmt.Sprintf("virtualis-%d-%s", inst.ID, sanitizeName(inst.Name))
 }
@@ -180,102 +182,6 @@ func sanitizeName(name string) string {
 	return b.String()
 }
 
-type Mock struct {
-	mu        sync.Mutex
-	instances map[uint]string
-}
-
-func NewMock() *Mock { return &Mock{instances: make(map[uint]string)} }
-
-func (m *Mock) Name() string                { return "mock" }
-func (m *Mock) Probe(context.Context) error { return nil }
-func (m *Mock) Create(ctx context.Context, inst *protocol.Instance) error {
-	if err := shortDelay(ctx); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.instances[inst.ID] = StatusStopped
-	m.mu.Unlock()
-	return nil
-}
-func (m *Mock) Delete(ctx context.Context, inst *protocol.Instance) error {
-	if err := shortDelay(ctx); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	delete(m.instances, inst.ID)
-	m.mu.Unlock()
-	return nil
-}
-func (m *Mock) Start(ctx context.Context, inst *protocol.Instance) error {
-	return m.set(ctx, inst.ID, StatusRunning)
-}
-func (m *Mock) Stop(ctx context.Context, inst *protocol.Instance) error {
-	return m.set(ctx, inst.ID, StatusStopped)
-}
-func (m *Mock) Restart(ctx context.Context, inst *protocol.Instance) error {
-	if err := m.Stop(ctx, inst); err != nil {
-		return err
-	}
-	return m.Start(ctx, inst)
-}
-func (m *Mock) HardStart(ctx context.Context, inst *protocol.Instance) error {
-	return m.Start(ctx, inst)
-}
-func (m *Mock) HardStop(ctx context.Context, inst *protocol.Instance) error { return m.Stop(ctx, inst) }
-func (m *Mock) HardRestart(ctx context.Context, inst *protocol.Instance) error {
-	return m.Restart(ctx, inst)
-}
-func (m *Mock) Reinstall(ctx context.Context, inst *protocol.Instance) error {
-	return m.set(ctx, inst.ID, StatusStopped)
-}
-func (m *Mock) Status(ctx context.Context, inst *protocol.Instance) (string, error) {
-	if err := shortDelay(ctx); err != nil {
-		return "", err
-	}
-	m.mu.Lock()
-	status, ok := m.instances[inst.ID]
-	m.mu.Unlock()
-	if !ok {
-		return StatusStopped, nil
-	}
-	return status, nil
-}
-func (m *Mock) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
-	if err := shortDelay(ctx); err != nil {
-		return protocol.Metrics{}, err
-	}
-	return defaultMetrics(inst), nil
-}
-func (m *Mock) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
-	if err := shortDelay(ctx); err != nil {
-		return protocol.NetworkStatus{}, err
-	}
-	status := collectHostNetwork(ctx, inst.Network)
-	if inst.Network.Mode == "" {
-		status.Reachable = true
-	}
-	return status, nil
-}
-func (m *Mock) VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error) {
-	return unsupportedVNC("mock")
-}
-func (m *Mock) set(ctx context.Context, id uint, status string) error {
-	if err := shortDelay(ctx); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.instances[id] = status
-	m.mu.Unlock()
-	return nil
-}
-func shortDelay(ctx context.Context) error {
-	t := time.NewTimer(10 * time.Millisecond)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func contains(s, part string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(part))
 }
