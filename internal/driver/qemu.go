@@ -82,8 +82,9 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 			diskPath = inst.Image.Path
 		}
 	}
+	PrepareDiskDir(d.dataDir)
 	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(diskPath), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
 			return fmt.Errorf("创建磁盘目录失败: %w", err)
 		}
 		if !hasCommand("qemu-img") {
@@ -96,6 +97,11 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 		if err := run(ctx, "qemu-img", "create", "-f", "qcow2", diskPath, fmt.Sprintf("%dG", size)); err != nil {
 			return err
 		}
+	}
+	// libvirt 以非 root 用户拉起 QEMU，root 落盘的镜像必须放开访问。
+	PrepareDiskFile(diskPath)
+	if isoPath != "" {
+		PrepareDiskFile(isoPath)
 	}
 
 	xml := domainXML(name, inst, diskPath, isoPath)

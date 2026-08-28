@@ -508,7 +508,7 @@ func (s *agentServer) storedInstance(id uint) (protocol.Instance, error) {
 }
 
 func (s *agentServer) saveImage(src io.Reader, filename string) (string, error) {
-	if err := os.MkdirAll(filepath.Join(s.dataDir, "images"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(s.dataDir, "images"), 0o755); err != nil {
 		return "", fmt.Errorf("创建镜像目录失败: %w", err)
 	}
 	raw := make([]byte, 12)
@@ -531,6 +531,8 @@ func (s *agentServer) saveImage(src io.Reader, filename string) (string, error) 
 		_ = os.Remove(path)
 		return "", errors.New("镜像文件超过 64 GiB")
 	}
+	// libvirt 的 QEMU 进程不是 root，落盘后立刻放开读取权限。
+	driver.PrepareDiskFile(path)
 	return path, nil
 }
 
@@ -764,9 +766,12 @@ func main() {
 			*name = "agent"
 		}
 	}
-	if err := os.MkdirAll(filepath.Join(*dataDir, "images"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(*dataDir, "images"), 0o755); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)
 	}
+	driver.PrepareDiskDir(*dataDir)
+	// 修复旧版本以 0600 落盘的存量镜像，升级重启后即可直接开机。
+	driver.PrepareAllDiskFiles(*dataDir)
 	state := newAgentServer(*token, *name, *version, *dataDir)
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
