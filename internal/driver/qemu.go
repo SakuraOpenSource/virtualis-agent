@@ -313,6 +313,11 @@ func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.N
 				break
 			}
 		}
+		if !status.Reachable {
+			// vnet 在、没地址：客户机侧问题（DHCP 未完成/未配置网络），
+			// 或没装 qemu-guest-agent 导致 agent/lease 两个来源都查不到。
+			status.Error = "实例网卡已连接但未获取到 IP：请确认客户机已配置网络（DHCP），安装 qemu-guest-agent 可提升 IP 可见性"
+		}
 	} else {
 		status.Error = "未找到虚拟网卡或虚拟机尚未启动"
 	}
@@ -324,7 +329,12 @@ func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.N
 func (d *QEMU) VNC(ctx context.Context, inst *protocol.Instance, host string) (protocol.VNCInfo, error) {
 	out, err := output(ctx, "virsh", "vncdisplay", resourceName("qemu", inst))
 	if err != nil {
-		return protocol.VNCInfo{Available: false, Message: "实例尚未启用 VNC 或尚未启动"}, nil
+		// 带上 virsh 的原始错误：域不存在、未运行、权限问题一眼可辨。
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return protocol.VNCInfo{Available: false, Message: "查询 VNC 失败（域可能不存在或未运行）: " + detail}, nil
 	}
 	display := strings.TrimSpace(string(out))
 	port := 0
