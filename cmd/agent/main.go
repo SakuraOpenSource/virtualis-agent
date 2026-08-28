@@ -389,8 +389,12 @@ func (s *agentServer) vncInstance(w http.ResponseWriter, r *http.Request, id uin
 	}
 	vnc, err := d.VNC(r.Context(), &instance, requestHost(r))
 	if err != nil {
+		log.Printf("VNC 查询实例 %d 失败: %v", id, err)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
+	}
+	if !vnc.Available {
+		log.Printf("VNC 实例 %d 不可用: %s", id, vnc.Message)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"vnc": vnc})
 }
@@ -505,14 +509,17 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 		return
 	}
 	if !vnc.Available || vnc.Port == 0 {
+		log.Printf("VNC WS 实例 %d 不可用: %s", id, vnc.Message)
 		writeError(w, http.StatusBadRequest, vnc.Message)
 		return
 	}
 	raw, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(vnc.Port)), 5*time.Second)
 	if err != nil {
+		log.Printf("VNC WS 实例 %d 连接 127.0.0.1:%d 失败: %v", id, vnc.Port, err)
 		writeError(w, http.StatusBadGateway, "连接 QEMU VNC 失败: "+err.Error())
 		return
 	}
+	log.Printf("VNC WS 实例 %d 已建立，目标 127.0.0.1:%d", id, vnc.Port)
 	defer raw.Close()
 	conn, err := vncUpgrader.Upgrade(w, r, nil)
 	if err != nil {
