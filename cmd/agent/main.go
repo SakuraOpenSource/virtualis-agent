@@ -267,7 +267,7 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 	}
 	instance.Driver = d.Name()
 	instance.Status = statusForAction(action)
-	applyOrClearNAT(r.Context(), d, &instance, s)
+	applyOrClearNAT(r.Context(), d, &instance, s, false)
 	s.mu.Lock()
 	s.instances[id] = instance
 	s.mu.Unlock()
@@ -295,6 +295,9 @@ func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id 
 	}
 	instance.Driver = d.Name()
 	instance.Status = status
+	// 自愈：域可能在被控升级/重启前就处于运行状态（那时没有 NAT 规则
+	// 逻辑），状态查询是最频繁的请求，借它幂等对账规则，无需重启实例。
+	applyOrClearNAT(r.Context(), d, &instance, s, true)
 	s.mu.Lock()
 	s.instances[id] = instance
 	s.mu.Unlock()
@@ -392,12 +395,17 @@ func (s *agentServer) vncInstance(w http.ResponseWriter, r *http.Request, id uin
 	writeJSON(w, http.StatusOK, map[string]any{"vnc": vnc})
 }
 
-// applyOrClearNAT 在电源动作后同步 NAT 规则：启动类动作应用全量清单
-// （含 IP 解析，最多约 15 秒），停止类动作清除。失败只记日志不阻塞开机。
-func applyOrClearNAT(ctx context.Context, d driver.Driver, instance *protocol.Instance, s *agentServer) {
+// applyOrClearNAT 在电源动作/状态查询后同步 NAT 规则：启动类动作应用
+// 全量清单，停止类动作清除。失败只记日志不阻塞开机。quick 用于高频的
+// 状态查询：IP 解析只试一次，避免拖慢接口。
+func applyOrClearNAT(ctx context.Context, d driver.Driver, instance *protocol.Instance, s *agentServer, quick bool) {
 	switch instance.Status {
 	case driver.StatusRunning:
-		if _, err := driver.ApplyNATRules(ctx, d, instance); err != nil {
+		retries, interval := 5, 3
+		if quick {
+			retries, interval = 1, 1
+		}
+		if _, err := driver.ApplyNATRules(ctx, d, instance, retries, interval); err != nil {
 			log.Printf("实例 %d 应用 NAT 映射失败: %v", instance.ID, err)
 		}
 	default:
@@ -428,7 +436,7 @@ func (s *agentServer) updateNATMappings(w http.ResponseWriter, r *http.Request, 
 	instance.NATMappings = payload.Mappings
 	if running, _ := d.Status(r.Context(), &instance); running == driver.StatusRunning {
 		instance.Status = driver.StatusRunning
-		applyOrClearNAT(r.Context(), d, &instance, s)
+		applyOrClearNAT(r.Context(), d, &instance, s, false)
 	} else {
 		driver.ClearNATRules(r.Context(), id)
 	}

@@ -91,7 +91,9 @@ func ResolveGuestIP(ctx context.Context, d Driver, inst *protocol.Instance, retr
 // ApplyNATRules 把实例的期望映射清单落地为 iptables 规则（幂等）。
 // 返回 (应用的条数, error)。解析不到目标 IP 时返回 (0, nil) 由调用方
 // 决定是否重试。
-func ApplyNATRules(ctx context.Context, d Driver, inst *protocol.Instance) (int, error) {
+// resolveRetries/resolveIntervalSec 控制 IP 解析耐心：电源动作走完整
+// 等待，状态轮询走快速路径避免拖慢接口。
+func ApplyNATRules(ctx context.Context, d Driver, inst *protocol.Instance, resolveRetries, resolveIntervalSec int) (int, error) {
 	if len(inst.NATMappings) == 0 {
 		ClearNATRules(ctx, inst.ID)
 		return 0, nil
@@ -99,7 +101,7 @@ func ApplyNATRules(ctx context.Context, d Driver, inst *protocol.Instance) (int,
 	if !hasIPTables() {
 		return 0, fmt.Errorf("iptables 未安装，无法配置 NAT 端口映射")
 	}
-	guestIP := ResolveGuestIP(ctx, d, inst, 5, 3)
+	guestIP := ResolveGuestIP(ctx, d, inst, resolveRetries, resolveIntervalSec)
 	if guestIP == "" {
 		return 0, fmt.Errorf("无法解析实例 IP，跳过 NAT 映射配置")
 	}
