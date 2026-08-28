@@ -31,7 +31,7 @@ if [[ -z "$NAME" ]]; then
   NAME="${NAME:-$(hostname)}"
 fi
 if [[ -z "$MODE" ]]; then
-  read -r -p "安装模式 [1=仅 Agent, 2=Incus, 3=LXC, 4=QEMU, 5=Mock] [1]: " MODE < /dev/tty || true
+  read -r -p "安装模式 [1=仅 Agent, 2=Incus, 3=LXC, 4=QEMU] [1]: " MODE < /dev/tty || true
   MODE="${MODE:-1}"
 fi
 
