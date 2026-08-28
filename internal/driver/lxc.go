@@ -34,6 +34,15 @@ func (d *LXC) Create(ctx context.Context, inst *protocol.Instance) error {
 		return fmt.Errorf("LXC 仅支持磁盘镜像类型")
 	}
 	name := resourceName("lxc", inst)
+	// NAT 模式保留静态地址，同时把网桥地址记为网关（静态配置没有 DHCP）。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat && inst.Network.IPv4 == "" {
+		if reserved, gateway := natSlotIP(inst); reserved != "" {
+			inst.Network.IPv4 = reserved
+			if network := &inst.Network; gateway != "" && network.Gateway == "" {
+				network.Gateway = gateway
+			}
+		}
+	}
 	if hasCommand("lxc-create") {
 		if err := run(ctx, "lxc-create", "-n", name, "-t", "local", "--", "-f", inst.Image.Path); err != nil {
 			return err
@@ -77,10 +86,11 @@ func configureLXCNetwork(name string, network protocol.NetworkConfig) error {
 	if network.MAC != "" {
 		lines = append(lines, "lxc.net.0.hwaddr = "+network.MAC)
 	}
-	if mode == NetworkModeDedicated && network.IPv4 != "" {
-		lines = append(lines, "lxc.net.0.ipv4.address = "+network.IPv4)
+	// NAT 保留的静态地址与独立 IP 都显式写入；网关是网桥自身地址。
+	if network.IPv4 != "" {
+		lines = append(lines, "lxc.net.0.ipv4.address = "+strings.Split(network.IPv4, "/")[0])
 	}
-	if mode == NetworkModeDedicated && network.Gateway != "" {
+	if network.Gateway != "" {
 		lines = append(lines, "lxc.net.0.ipv4.gateway = "+network.Gateway)
 	}
 	_, err = file.WriteString(strings.Join(lines, "\n") + "\n")
@@ -192,6 +202,18 @@ func (d *LXC) Network(ctx context.Context, inst *protocol.Instance) (protocol.Ne
 		}
 	}
 	return status, nil
+}
+
+// SetRootPassword 经 lxc-attach 注入 root 密码。
+func (d *LXC) SetRootPassword(ctx context.Context, inst *protocol.Instance, password string) error {
+	name := resourceName("lxc", inst)
+	if hasCommand("lxc-attach") {
+		if err := run(ctx, "lxc-attach", "-n", name, "--", "sh", "-c", "echo root:"+password+" | chpasswd"); err != nil {
+			return fmt.Errorf("设置密码失败（实例可能尚未启动完成）: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("lxc-attach 未安装，无法设置密码")
 }
 
 // VNC：LXC 容器无图形控制台。

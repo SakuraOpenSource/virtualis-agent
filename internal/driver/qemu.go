@@ -104,6 +104,19 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 		PrepareDiskFile(isoPath)
 	}
 
+	// NAT 模式：派生确定性 MAC 并在 libvirt 网络里做静态 DHCP 保留，
+	// 让实例每次都拿到同一 IP，NAT 映射的目标地址才稳定。保留失败
+	// （老版本 libvirt 等）不阻塞创建，映射走动态解析回退。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
+		if inst.Network.MAC == "" {
+			inst.Network.MAC = natMAC(inst)
+		}
+		reserved, _ := natSlotIP(inst)
+		if reserved != "" && d.reserveNATIP(ctx, inst.Network.MAC, reserved) {
+			inst.Network.IPv4 = reserved
+		}
+	}
+
 	xml := domainXML(name, inst, diskPath, isoPath)
 	tmp, err := os.CreateTemp("", "virtualis-domain-*.xml")
 	if err != nil {
@@ -339,6 +352,35 @@ func (d *QEMU) VNC(ctx context.Context, inst *protocol.Instance, host string) (p
 		host = "127.0.0.1"
 	}
 	return protocol.VNCInfo{Available: true, Protocol: "vnc", Host: host, Port: port, Display: display, URL: fmt.Sprintf("vnc://%s:%d", host, port)}, nil
+}
+
+// reserveNATIP 在 libvirt default 网络里登记 MAC→IP 的静态 DHCP 条目。
+// 返回是否成功；失败时调用方不写静态值，让映射回退到动态解析。
+func (d *QEMU) reserveNATIP(ctx context.Context, mac, ip string) bool {
+	hostXML := fmt.Sprintf("<host mac='%s' ip='%s'/>", html.EscapeString(mac), html.EscapeString(ip))
+	err := run(ctx, "virsh", "net-update", "default", "add-last", "ip-dhcp-host", hostXML, "--live", "--config")
+	return err == nil || contains(err.Error(), "exists")
+}
+
+// SetRootPassword 经 guest agent 设置 root 密码。客户机的
+// qemu-guest-agent 启动完成前该调用会失败，做约 40 秒的有限重试。
+func (d *QEMU) SetRootPassword(ctx context.Context, inst *protocol.Instance, password string) error {
+	name := resourceName("qemu", inst)
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+		lastErr = run(ctx, "virsh", "set-user-password", "--domain", name, "--user", "root", "--password", password)
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("设置密码失败（确认客户机已安装并启动 qemu-guest-agent）: %w", lastErr)
 }
 
 func parseKeyValues(text string) map[string]uint64 {

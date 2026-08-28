@@ -31,6 +31,14 @@ type Image struct {
 	Path         string `json:"path,omitempty"`
 }
 
+// NATMapping 是一条 NAT 端口转发：宿主机的 HostPort 转发到实例的
+// GuestPort。目标实例 IP 由被控在应用规则时解析（静态保留或动态查询）。
+type NATMapping struct {
+	Protocol  string `json:"protocol"` // tcp / udp
+	HostPort  int    `json:"host_port"`
+	GuestPort int    `json:"guest_port"`
+}
+
 type Instance struct {
 	ID          uint          `json:"id"`
 	Name        string        `json:"name"`
@@ -42,6 +50,9 @@ type Instance struct {
 	Spec        InstanceSpec  `json:"spec"`
 	Network     NetworkConfig `json:"network"`
 	Image       *Image        `json:"image,omitempty"`
+	// NATMappings 是主控落库的期望清单，被控开机时据此配置 DNAT，
+	// 关机/删除时清除。整表下发，由被控幂等对账。
+	NATMappings []NATMapping `json:"nat_mappings,omitempty"`
 }
 
 type Metrics struct {

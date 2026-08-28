@@ -186,6 +186,10 @@ func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
 		s.networkInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "vnc":
 		s.vncInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "nat":
+		s.updateNATMappings(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "password":
+		s.setPassword(w, r, id)
 	case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "vnc" && parts[2] == "ws":
 		s.vncWebSocket(w, r, id)
 	default:
@@ -211,6 +215,7 @@ func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id 
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	driver.ClearNATRules(r.Context(), id)
 	if instance.Image != nil && instance.Image.Path != "" {
 		_ = os.Remove(instance.Image.Path)
 	}
@@ -262,6 +267,7 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 	}
 	instance.Driver = d.Name()
 	instance.Status = statusForAction(action)
+	applyOrClearNAT(r.Context(), d, &instance, s)
 	s.mu.Lock()
 	s.instances[id] = instance
 	s.mu.Unlock()
@@ -384,6 +390,82 @@ func (s *agentServer) vncInstance(w http.ResponseWriter, r *http.Request, id uin
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"vnc": vnc})
+}
+
+// applyOrClearNAT 在电源动作后同步 NAT 规则：启动类动作应用全量清单
+// （含 IP 解析，最多约 15 秒），停止类动作清除。失败只记日志不阻塞开机。
+func applyOrClearNAT(ctx context.Context, d driver.Driver, instance *protocol.Instance, s *agentServer) {
+	switch instance.Status {
+	case driver.StatusRunning:
+		if _, err := driver.ApplyNATRules(ctx, d, instance); err != nil {
+			log.Printf("实例 %d 应用 NAT 映射失败: %v", instance.ID, err)
+		}
+	default:
+		driver.ClearNATRules(ctx, instance.ID)
+	}
+}
+
+// updateNATMappings 让被控按主控下发的全量清单对账 NAT 规则。实例运行中
+// 立即生效；关机状态只清除已移除映射的规则并保存清单。
+func (s *agentServer) updateNATMappings(w http.ResponseWriter, r *http.Request, id uint) {
+	var payload struct {
+		Instance protocol.Instance     `json:"instance"`
+		Mappings []protocol.NATMapping `json:"mappings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Instance.ID != id {
+		writeError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	instance, err := s.storedInstance(id)
+	if err != nil {
+		instance = payload.Instance
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	instance.NATMappings = payload.Mappings
+	if running, _ := d.Status(r.Context(), &instance); running == driver.StatusRunning {
+		instance.Status = driver.StatusRunning
+		applyOrClearNAT(r.Context(), d, &instance, s)
+	} else {
+		driver.ClearNATRules(r.Context(), id)
+	}
+	s.mu.Lock()
+	s.instances[id] = instance
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
+}
+
+// setPassword 向运行中的实例注入 root 密码（容器 exec / QEMU guest agent）。
+func (s *agentServer) setPassword(w http.ResponseWriter, r *http.Request, id uint) {
+	var payload struct {
+		Instance protocol.Instance `json:"instance"`
+		Password string            `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Instance.ID != id {
+		writeError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	if payload.Password == "" {
+		writeError(w, http.StatusBadRequest, "password required")
+		return
+	}
+	instance, err := s.storedInstance(id)
+	if err != nil {
+		instance = payload.Instance
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := d.SetRootPassword(r.Context(), &instance, payload.Password); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 var vncUpgrader = websocket.Upgrader{

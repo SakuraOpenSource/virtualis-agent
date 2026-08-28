@@ -48,8 +48,16 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	if inst.Spec.MemoryMB > 0 {
 		args = append(args, "-c", fmt.Sprintf("limits.memory=%dMiB", inst.Spec.MemoryMB))
 	}
+	// NAT 模式保留静态地址（dnsmasq 静态租约），NAT 映射目标才稳定。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
+		if inst.Network.IPv4 == "" {
+			if reserved, _ := natSlotIP(inst); reserved != "" {
+				inst.Network.IPv4 = reserved
+			}
+		}
+	}
 	// 网络在 launch 时一次性声明，避免先起在默认网络再迁移带来的抖动。
-	netArgs := incusDeviceArgs(inst.Network)
+	netArgs := incusDeviceArgs(inst.Network, inst)
 	if len(netArgs) > 0 {
 		args = append(args, netArgs...)
 	}
@@ -65,11 +73,19 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 // NAT：nic 默认网络（incusbr0），DHCP 自动发地址，共享主机出口 IP。
 // 独立 IP：nic bridged 挂到主机网桥；IPv4/gateway/DNS 显式下发给容器。
 // 关闭：nic none。
-func incusDeviceArgs(network protocol.NetworkConfig) []string {
+func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []string {
 	switch NormalizeNetworkMode(network.Mode) {
 	case NetworkModeNone:
 		return []string{"-d", "eth0,nic,type=none"}
 	case NetworkModeNat:
+		// 有保留地址时显式声明 bridged 设备，让 dnsmasq 发固定租约。
+		if network.IPv4 != "" {
+			spec := "eth0,nic,type=bridged,parent=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
+			if network.MAC != "" {
+				spec += ",hwaddr=" + network.MAC
+			}
+			return []string{"-d", spec}
+		}
 		return nil // 不指定时 Incus 用 default 网络的 eth0
 	}
 	parent := "incusbr0"
@@ -172,6 +188,15 @@ func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.
 		}
 	}
 	return status, nil
+}
+
+// SetRootPassword 经 exec 注入 root 密码，容器启动后立即可用。
+func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, password string) error {
+	name := resourceName("incus", inst)
+	if err := run(ctx, d.cli(), "exec", name, "--", "sh", "-c", "echo root:"+password+" | chpasswd"); err != nil {
+		return fmt.Errorf("设置密码失败（实例可能尚未启动完成）: %w", err)
+	}
+	return nil
 }
 
 // VNC：Incus 容器/VM 无原生 TCP VNC，控制台走 incus console。

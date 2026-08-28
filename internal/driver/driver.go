@@ -35,6 +35,10 @@ type Driver interface {
 	Metrics(context.Context, *protocol.Instance) (protocol.Metrics, error)
 	Network(context.Context, *protocol.Instance) (protocol.NetworkStatus, error)
 	VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error)
+	// SetRootPassword 尝试把 root 密码注入运行中的实例。容器走 exec
+	// chpasswd 立即生效；QEMU 依赖 guest agent，客户机启动完成前会失败，
+	// 实现内部做有限重试。注入失败返回错误，由调用方决定是否重试。
+	SetRootPassword(context.Context, *protocol.Instance, string) error
 }
 
 type Capability struct {
