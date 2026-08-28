@@ -523,11 +523,14 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 	defer raw.Close()
 	conn, err := vncUpgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("VNC WS 实例 %d 升级失败: %v", id, err)
 		return
 	}
 	defer conn.Close()
 	conn.SetReadLimit(16 << 20)
 	result := make(chan error, 2)
+	// 双向首包日志：RFB 握手卡住时，journal 能直接看出数据断在哪个方向。
+	var toGuest, toBrowser logFirst
 	go func() {
 		for {
 			_, reader, readErr := conn.NextReader()
@@ -539,6 +542,7 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 				result <- copyErr
 				return
 			}
+			toGuest.once(func() { log.Printf("VNC WS 实例 %d 收到浏览器首包 → QEMU", id) })
 		}
 	}()
 	go func() {
@@ -546,6 +550,7 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 		for {
 			n, readErr := raw.Read(buffer)
 			if n > 0 {
+				toBrowser.once(func() { log.Printf("VNC WS 实例 %d 收到 QEMU 首包（RFB banner）→ 浏览器", id) })
 				writer, writeErr := conn.NextWriter(websocket.BinaryMessage)
 				if writeErr != nil {
 					result <- writeErr
@@ -567,8 +572,17 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 			}
 		}
 	}()
-	<-result
+	if err := <-result; err != nil {
+		log.Printf("VNC WS 实例 %d 断开: %v", id, err)
+	}
 }
+
+// logFirst 让一段日志只打一次。
+type logFirst struct {
+	do sync.Once
+}
+
+func (l *logFirst) once(fn func()) { l.do.Do(fn) }
 
 func requestHost(r *http.Request) string {
 	host := r.Host
