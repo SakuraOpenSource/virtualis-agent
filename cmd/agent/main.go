@@ -20,6 +20,7 @@ import (
 	goruntime "runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -529,8 +530,11 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 	defer conn.Close()
 	conn.SetReadLimit(16 << 20)
 	result := make(chan error, 2)
-	// 双向首包日志：RFB 握手卡住时，journal 能直接看出数据断在哪个方向。
+	// 双向首包与字节计数：RFB 握手卡住或秒断时，journal 能直接看出
+	// 数据断在哪个方向、断前传了多少（几十字节=安全协商崩，KB 级=会话
+	// 已建立后被杀）。
 	var toGuest, toBrowser logFirst
+	var bytesToGuest, bytesToBrowser uint64
 	go func() {
 		for {
 			_, reader, readErr := conn.NextReader()
@@ -538,7 +542,9 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 				result <- readErr
 				return
 			}
-			if _, copyErr := io.Copy(raw, reader); copyErr != nil {
+			n, copyErr := io.Copy(raw, reader)
+			atomic.AddUint64(&bytesToGuest, uint64(n))
+			if copyErr != nil {
 				result <- copyErr
 				return
 			}
@@ -550,6 +556,7 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 		for {
 			n, readErr := raw.Read(buffer)
 			if n > 0 {
+				atomic.AddUint64(&bytesToBrowser, uint64(n))
 				toBrowser.once(func() { log.Printf("VNC WS 实例 %d 收到 QEMU 首包（RFB banner）→ 浏览器", id) })
 				writer, writeErr := conn.NextWriter(websocket.BinaryMessage)
 				if writeErr != nil {
@@ -573,7 +580,8 @@ func (s *agentServer) vncWebSocket(w http.ResponseWriter, r *http.Request, id ui
 		}
 	}()
 	if err := <-result; err != nil {
-		log.Printf("VNC WS 实例 %d 断开: %v", id, err)
+		log.Printf("VNC WS 实例 %d 断开: %v（QEMU→浏览器 %d B / 浏览器→QEMU %d B）",
+			id, err, atomic.LoadUint64(&bytesToBrowser), atomic.LoadUint64(&bytesToGuest))
 	}
 }
 
