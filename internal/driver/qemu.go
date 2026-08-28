@@ -135,7 +135,20 @@ func (d *QEMU) Start(ctx context.Context, inst *protocol.Instance) error {
 	if err := d.ensureNetwork(ctx, inst); err != nil {
 		return err
 	}
-	return d.action(ctx, "start", inst, "already active")
+	err := d.action(ctx, "start", inst, "already active")
+	if err == nil {
+		return nil
+	}
+	// 自愈：宿主机重启后 libvirt default 网络可能仍未自启，libvirt 会在
+	// 域启动时报 "network ... is not active"。这里强制拉起网络后重试一次。
+	if contains(err.Error(), "network") && contains(err.Error(), "not active") {
+		if fixErr := d.ensureDefaultNetwork(ctx); fixErr == nil {
+			if retryErr := d.action(ctx, "start", inst, "already active"); retryErr == nil {
+				return nil
+			}
+		}
+	}
+	return err
 }
 func (d *QEMU) Stop(ctx context.Context, inst *protocol.Instance) error {
 	return d.action(ctx, "shutdown", inst, "not active", "Domain not found")
@@ -407,9 +420,13 @@ func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error
 }
 
 // ensureDefaultNetwork 定义并启动 libvirt default NAT 网络（幂等）。
+//
+// 不用 net-info 的 Active 字段判断是否需要启动：该输出是表格对齐格式，
+// 不同 libvirt 版本冒号与值的间隔空格数不同，字符串解析不可靠，误判
+// "已激活" 会导致跳过启动、域开机时报 network not active。net-start
+// 本身幂等且廉价，网络已激活时报错含 "already active"，直接忽略。
 func (d *QEMU) ensureDefaultNetwork(ctx context.Context) error {
-	info, err := output(ctx, "virsh", "net-info", "default")
-	if err != nil {
+	if _, err := output(ctx, "virsh", "net-info", "default"); err != nil {
 		xml := `<network>
   <name>default</name>
   <forward mode='nat'/>
@@ -437,20 +454,12 @@ func (d *QEMU) ensureDefaultNetwork(ctx context.Context) error {
 		if defineErr := run(ctx, "virsh", "net-define", tmpName); defineErr != nil && !contains(defineErr.Error(), "already exists") {
 			return fmt.Errorf("定义 libvirt default 网络失败: %w", defineErr)
 		}
-		info, err = output(ctx, "virsh", "net-info", "default")
-	}
-	if err != nil {
-		return fmt.Errorf("读取 libvirt default 网络失败: %w", err)
-	}
-	if contains(string(info), "active: yes") {
-		return nil
 	}
 	if err := run(ctx, "virsh", "net-start", "default"); err != nil && !contains(err.Error(), "already active") {
 		return fmt.Errorf("启动 libvirt default 网络失败: %w", err)
 	}
-	if err := run(ctx, "virsh", "net-autostart", "default"); err != nil && !contains(err.Error(), "already active") {
-		return fmt.Errorf("设置 libvirt default 网络开机启动失败: %w", err)
-	}
+	// 自启动尽力而为：失败只影响宿主机重启后的第一台虚拟机，本次开机不受影响。
+	_ = run(ctx, "virsh", "net-autostart", "default")
 	return nil
 }
 

@@ -90,3 +90,18 @@ func TestCollectHostNetworkExcludesLoopback(t *testing.T) {
 		}
 	}
 }
+
+func TestDomainXMLDefaultsToNATWhenModeEmpty(t *testing.T) {
+	// 创建时未配置网络模式：按 NAT 处理，网卡挂 libvirt default 网络，
+	// 由被控自动定义并拉起该网络（共享主机出口 IP）。
+	inst := &protocol.Instance{
+		ID:   9,
+		Name: "bare",
+		Type: "vm",
+		Spec: protocol.InstanceSpec{CPU: 1, MemoryMB: 512, DiskGB: 10},
+	}
+	xml := domainXML(resourceName("qemu", inst), inst, "/data/images/disk.qcow2", "")
+	if !strings.Contains(xml, "<interface type='network'>") || !strings.Contains(xml, "network='default'") {
+		t.Errorf("空网络模式应默认 NAT 并挂 default 网络:\n%s", xml)
+	}
+}
