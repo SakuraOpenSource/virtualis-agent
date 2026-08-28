@@ -768,6 +768,9 @@ func (s *agentServer) register(ctx context.Context, master, endpoint string) err
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("主控拒绝注册 (401)：接入 token 已失效或节点已被删除，请在主控重新生成接入指令并更新 --token 后重启被控")
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return fmt.Errorf("主控拒绝注册 (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
