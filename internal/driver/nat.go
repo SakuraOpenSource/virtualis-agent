@@ -101,6 +101,11 @@ func ApplyNATRules(ctx context.Context, d Driver, inst *protocol.Instance, resol
 	if !hasIPTables() {
 		return 0, fmt.Errorf("iptables 未安装，无法配置 NAT 端口映射")
 	}
+	// 先对账 NAT 身份（真实 MAC ↔ DHCP 保留 ↔ 静态地址）：旧版本创建的
+	// 实例在这里自愈，随后解析到的静态 IP 才可信。
+	if reconciler, ok := d.(NATIdentityReconciler); ok {
+		reconciler.EnsureNATIdentity(ctx, inst)
+	}
 	guestIP := ResolveGuestIP(ctx, d, inst, resolveRetries, resolveIntervalSec)
 	if guestIP == "" {
 		return 0, fmt.Errorf("无法解析实例 IP，跳过 NAT 映射配置")

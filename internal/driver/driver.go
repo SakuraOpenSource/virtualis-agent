@@ -41,6 +41,14 @@ type Driver interface {
 	SetRootPassword(context.Context, *protocol.Instance, string) error
 }
 
+// NATIdentityReconciler 由支持 NAT 的驱动可选实现：按域里网卡的"真实 MAC"
+// 重对账 DHCP 静态保留。历史实例的域可能由旧版本代码定义（当时 MAC 为空，
+// libvirt 派随机地址），代码里派生的 MAC 与实际网卡不一致会让静态保留
+// 永远等不到匹配的客户端，实例拿不到保留 IP。
+type NATIdentityReconciler interface {
+	EnsureNATIdentity(ctx context.Context, inst *protocol.Instance)
+}
+
 type Capability struct {
 	Name      string `json:"name"`
 	Available bool   `json:"available"`

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -370,6 +371,68 @@ func (d *QEMU) reserveNATIP(ctx context.Context, mac, ip string) bool {
 	hostXML := fmt.Sprintf("<host mac='%s' ip='%s'/>", html.EscapeString(mac), html.EscapeString(ip))
 	err := run(ctx, "virsh", "net-update", "default", "add-last", "ip-dhcp-host", hostXML, "--live", "--config")
 	return err == nil || contains(err.Error(), "exists")
+}
+
+// unreserveNATIP 删除一条 MAC→IP 的静态 DHCP 条目，不存在时静默成功。
+func (d *QEMU) unreserveNATIP(ctx context.Context, mac, ip string) {
+	hostXML := fmt.Sprintf("<host mac='%s' ip='%s'/>", html.EscapeString(mac), html.EscapeString(ip))
+	_ = run(ctx, "virsh", "net-update", "default", "delete", "ip-dhcp-host", hostXML, "--live", "--config")
+}
+
+// EnsureNATIdentity 让 NAT 静态保留与域里网卡的"真实 MAC"对齐
+// （NATIdentityReconciler）。
+//
+// 旧版本代码创建的实例域里 MAC 字段可能为空——macXML 对空值不输出
+// <mac>，libvirt 会派一个随机地址；而 DHCP 静态保留是按派生 MAC 写的，
+// 永远等不到匹配的客户端，实例就拿不到保留 IP。这里以 domiflist 查到的
+// 实际 MAC 为权威改写保留条目，并把真实 MAC/保留 IP 回填进 inst.Network，
+// 由上层同步回主控。域未定义时直接返回（创建流程自己会做首次保留）。
+func (d *QEMU) EnsureNATIdentity(ctx context.Context, inst *protocol.Instance) {
+	if NormalizeNetworkMode(inst.Network.Mode) != NetworkModeNat {
+		return
+	}
+	name := resourceName("qemu", inst)
+	if !d.exists(ctx, name) {
+		return
+	}
+	out, err := output(ctx, "virsh", "domiflist", name)
+	if err != nil {
+		return
+	}
+	ifaces := parseQEMUInterfaces(string(out))
+	if len(ifaces) == 0 {
+		return
+	}
+	actualMAC := strings.ToLower(ifaces[0].MAC)
+	if _, parseErr := net.ParseMAC(actualMAC); parseErr != nil {
+		return
+	}
+	reservedIP, _ := natSlotIP(inst)
+	if reservedIP == "" {
+		return
+	}
+	// DB 里 MAC 可能为空：此时按派生 MAC 反查旧保留条目一并清理。
+	oldMAC := strings.ToLower(strings.TrimSpace(inst.Network.MAC))
+	if oldMAC == "" {
+		oldMAC = strings.ToLower(natMAC(inst))
+	}
+	oldIP := strings.Split(inst.Network.IPv4, "/")[0]
+	if oldMAC == actualMAC && oldIP == reservedIP {
+		return
+	}
+	if oldMAC != actualMAC {
+		d.unreserveNATIP(ctx, oldMAC, oldIP)
+	}
+	if oldIP != "" && oldIP != reservedIP {
+		d.unreserveNATIP(ctx, actualMAC, oldIP)
+	}
+	if !d.reserveNATIP(ctx, actualMAC, reservedIP) {
+		log.Printf("NAT 实例 %d 写入 DHCP 保留失败: MAC %s → %s", inst.ID, actualMAC, reservedIP)
+		return
+	}
+	inst.Network.MAC = actualMAC
+	inst.Network.IPv4 = reservedIP
+	log.Printf("NAT 实例 %d 身份已对账: 网卡 MAC %s ↔ 保留 IP %s", inst.ID, actualMAC, reservedIP)
 }
 
 // SetRootPassword 经 guest agent 设置 root 密码。客户机的
