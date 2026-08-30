@@ -82,11 +82,11 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []string {
 	switch NormalizeNetworkMode(network.Mode) {
 	case NetworkModeNone:
-		return []string{"-d", "eth0,nic,type=none"}
+		return []string{"-d", "eth0,nic,nictype=none"}
 	case NetworkModeNat:
 		// 有保留地址时显式声明 bridged 设备，让 dnsmasq 发固定租约。
 		if network.IPv4 != "" {
-			spec := "eth0,nic,type=bridged,parent=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
+			spec := "eth0,nic,nictype=bridged,parent=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
 			if network.MAC != "" {
 				spec += ",hwaddr=" + network.MAC
 			}
@@ -98,7 +98,7 @@ func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []
 	if value := strings.TrimSpace(network.Bridge); value != "" {
 		parent = value
 	}
-	spec := fmt.Sprintf("eth0,nic,type=bridged,parent=%s", parent)
+	spec := fmt.Sprintf("eth0,nic,nictype=bridged,parent=%s", parent)
 	if network.MAC != "" {
 		spec += ",hwaddr=" + network.MAC
 	}
