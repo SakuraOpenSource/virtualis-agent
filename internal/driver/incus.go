@@ -37,9 +37,9 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	alias := fmt.Sprintf("virtualis-img-%d", inst.ID)
 	// 分割镜像（meta.tar.xz + rootfs.tar.xz / disk.qcow2）传两个文件；
 	// 统一镜像（单 tar）只传 Path。
-	importArgs := []string{"image", "import", inst.Image.Path, alias}
+	importArgs := []string{"image", "import", inst.Image.Path, "--alias", alias}
 	if inst.Image.ExtraPath != "" {
-		importArgs = []string{"image", "import", inst.Image.ExtraPath, inst.Image.Path, alias}
+		importArgs = []string{"image", "import", inst.Image.ExtraPath, inst.Image.Path, "--alias", alias}
 	}
 	if err := run(ctx, d.cli(), importArgs...); err != nil {
 		return fmt.Errorf("导入离线镜像失败: %w", err)
