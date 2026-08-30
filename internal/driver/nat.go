@@ -27,27 +27,36 @@ func natTag(id uint) string { return natTagPrefix + strconv.FormatUint(uint64(id
 func hasIPTables() bool { return hasCommand("iptables") }
 
 // natSlotIP 计算实例在 NAT 网桥子网里的静态保留 IP 与网关（网桥自身地址）。
+// 兼容入口：QEMU/libvirt 用 virbr0，Incus 用 incusbr0，按各自网桥推导。
 //
 // 槽位按实例 ID 确定性分配（100 + id%140 → x.x.x.100-249），避开网桥
-// 自身的 .1，同一被控上不同实例不会撞号。找不到已知 NAT 网桥时返回空。
+// 自身的 .1，同一被控上不同实例不会撞号。找不到网桥时返回空。
 func natSlotIP(inst *protocol.Instance) (string, string) {
 	for _, bridge := range []string{"virbr0", "incusbr0"} {
-		iface, err := net.InterfaceByName(bridge)
-		if err != nil {
+		if ip, gw := natSlotIPOn(bridge, inst); ip != "" {
+			return ip, gw
+		}
+	}
+	return "", ""
+}
+
+// natSlotIPOn 在指定网桥的子网里推导实例的静态保留 IP。
+func natSlotIPOn(bridge string, inst *protocol.Instance) (string, string) {
+	iface, err := net.InterfaceByName(bridge)
+	if err != nil {
+		return "", ""
+	}
+	addrs, _ := iface.Addrs()
+	for _, addr := range addrs {
+		ip, ipNet, err := net.ParseCIDR(addr.String())
+		if err != nil || ip.To4() == nil {
 			continue
 		}
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			ip, ipNet, err := net.ParseCIDR(addr.String())
-			if err != nil || ip.To4() == nil {
-				continue
-			}
-			base := ip.To4()
-			mask := ipNet.Mask
-			slot := 100 + int(inst.ID%140)
-			guest := net.IPv4(base[0]&mask[0], base[1]&mask[1], base[2]&mask[2], byte(slot)).String()
-			return guest, ip.String()
-		}
+		base := ip.To4()
+		mask := ipNet.Mask
+		slot := 100 + int(inst.ID%140)
+		guest := net.IPv4(base[0]&mask[0], base[1]&mask[1], base[2]&mask[2], byte(slot)).String()
+		return guest, ip.String()
 	}
 	return "", ""
 }

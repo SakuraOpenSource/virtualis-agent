@@ -70,9 +70,12 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	// NAT 模式保留静态地址（dnsmasq 静态租约），NAT 映射目标才稳定。
 	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
 		if inst.Network.IPv4 == "" {
-			if reserved, _ := natSlotIP(inst); reserved != "" {
-				inst.Network.IPv4 = reserved
+			// Incus 容器挂 incusbr0，保留地址必须落在它的子网内。
+			reserved, _ := natSlotIPOn("incusbr0", inst)
+			if reserved == "" {
+				reserved = fmt.Sprintf("10.10.10.%d", 100+int(inst.ID%140))
 			}
+			inst.Network.IPv4 = reserved
 		}
 	}
 	// 每实例一个专用 profile 承载网络/资源限制：launch 的 -d 简写在
