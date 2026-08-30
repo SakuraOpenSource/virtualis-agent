@@ -176,6 +176,10 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		instance.Status = driver.StatusStopped
 	}
 	instance.RootPassword = ""
+	// 创建即应用 NAT 映射：运行态的实例不该等第一次状态查询才通。
+	if instance.Status == driver.StatusRunning {
+		applyOrClearNAT(r.Context(), d, &instance, s, false)
+	}
 	s.mu.Lock()
 	s.instances[instance.ID] = instance
 	s.mu.Unlock()
