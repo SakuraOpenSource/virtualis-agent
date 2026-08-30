@@ -55,11 +55,12 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 		}
 		fingerprint := ""
 		for _, line := range strings.Split(string(out), "\n") {
+			// CSV 列：alias,fingerprint,public,description,...
 			cols := strings.Split(line, ",")
-			if len(cols) < 3 || !strings.Contains(cols[0], "virtualis-img-") {
+			if len(cols) < 2 || !strings.Contains(cols[0], "virtualis-img-") {
 				continue
 			}
-			fingerprint = cols[2]
+			fingerprint = cols[1]
 			break
 		}
 		if fingerprint == "" || run(ctx, d.cli(), "image", "alias", "create", alias, fingerprint) != nil {
