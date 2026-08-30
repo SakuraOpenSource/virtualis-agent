@@ -2,17 +2,31 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
 
 // Incus 驱动：离线导入镜像后 launch，网络经 device 配置。
-type Incus struct{}
+type Incus struct {
+	mu      sync.Mutex
+	samples map[uint]incusSample
+}
 
-func NewIncus() *Incus        { return &Incus{} }
+type incusSample struct {
+	cpuTime uint64
+	rx, tx  uint64
+	at      time.Time
+}
+
+func NewIncus() *Incus {
+	return &Incus{samples: make(map[uint]incusSample)}
+}
 func (d *Incus) Name() string { return "incus" }
 
 func (d *Incus) Probe(ctx context.Context) error {
@@ -81,7 +95,7 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	// 每实例一个专用 profile 承载网络/资源限制：launch 的 -d 简写在
 	// Incus 6 上解析不可靠，profile device add 的位置参数语法最稳。
 	profile := fmt.Sprintf("virtualis-p-%d", inst.ID)
-	if err := d.ensureProfile(ctx, profile, inst.Network); err != nil {
+	if err := d.ensureProfile(ctx, profile, inst.Network, inst); err != nil {
 		return err
 	}
 	args := []string{"launch", alias, name, "-p", profile}
@@ -103,13 +117,18 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 
 // ensureProfile 建立实例专用 profile 并按网络模式写入 eth0/root 设备。
 // 幂等：profile 已存在时仅重建设备定义。
-func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig) error {
+func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig, inst *protocol.Instance) error {
 	if err := run(ctx, d.cli(), "profile", "create", profile); err != nil && !contains(err.Error(), "already exists") {
 		return fmt.Errorf("创建实例 profile 失败: %w", err)
 	}
 	// 从默认 profile 继承 root 磁盘；已存在先移除再添加（幂等重建）。
+	// size 是磁盘配额：需要 btrfs/zfs 存储池才生效（dir 池不支持）。
 	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
-	if err := run(ctx, d.cli(), "profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"); err != nil {
+	rootArgs := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"}
+	if size := inst.Spec.DiskGB; size > 0 {
+		rootArgs = append(rootArgs, fmt.Sprintf("size=%dGiB", size))
+	}
+	if err := run(ctx, d.cli(), rootArgs...); err != nil {
 		return fmt.Errorf("配置 root 磁盘失败: %w", err)
 	}
 	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "eth0")
@@ -245,31 +264,135 @@ func (d *Incus) Status(ctx context.Context, inst *protocol.Instance) (string, er
 	return StatusStopped, nil
 }
 
-func (d *Incus) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
-	metrics := collectHostMetrics(inst)
-	name := resourceName("incus", inst)
-	if out, err := output(ctx, d.cli(), "info", name, "--resources"); err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			lower := strings.ToLower(strings.TrimSpace(line))
-			if strings.HasPrefix(lower, "memory:") && strings.Contains(lower, "used") {
-				// Incus 输出是人类可读格式；解析不出时保留配置值作为总量。
-				metrics.MemoryUsedMB = parseMiB(lower)
-			}
+// incusState 是 incus query .../state 里采集需要字段的子集。
+type incusState struct {
+	CPU struct {
+		Usage uint64 `json:"usage"`
+	} `json:"cpu"`
+	Memory struct {
+		Usage uint64 `json:"usage"`
+		Total uint64 `json:"total"`
+	} `json:"memory"`
+	Network map[string]struct {
+		Addresses []struct {
+			Family  string `json:"family"`
+			Address string `json:"address"`
+			Scope   string `json:"scope"`
+		} `json:"addresses"`
+		Counters struct {
+			BytesReceived uint64 `json:"bytes_received"`
+			BytesSent     uint64 `json:"bytes_sent"`
+		} `json:"counters"`
+		HWAddr string `json:"hwaddr"`
+		State  string `json:"state"`
+	} `json:"network"`
+}
+
+// queryState 拉取实例的运行状态 JSON（incus query 的权威数据源）。
+func (d *Incus) queryState(ctx context.Context, name string) (*incusState, error) {
+	out, err := output(ctx, d.cli(), "query", "/1.0/instances/"+name+"/state")
+	if err != nil {
+		return nil, err
+	}
+	var envelope struct {
+		Metadata *incusState `json:"metadata"`
+	}
+	if err := json.Unmarshal(out, &envelope); err != nil || envelope.Metadata == nil {
+		// 某些版本直接返回状态对象。
+		var direct incusState
+		if err2 := json.Unmarshal(out, &direct); err2 != nil {
+			return nil, fmt.Errorf("解析实例状态失败: %w", err)
 		}
+		return &direct, nil
+	}
+	return envelope.Metadata, nil
+}
+
+func (d *Incus) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {
+	name := resourceName("incus", inst)
+	state, err := d.queryState(ctx, name)
+	if err != nil {
+		return protocol.Metrics{}, err
+	}
+	metrics := defaultMetrics(inst)
+	metrics.CollectedAt = time.Now().UTC()
+	if state.Memory.Total > 0 {
+		metrics.MemoryTotalMB = int64(state.Memory.Total / 1024 / 1024)
+	}
+	metrics.MemoryUsedMB = int64(state.Memory.Usage / 1024 / 1024)
+	var rxBytes, txBytes uint64
+	for _, net := range state.Network {
+		rxBytes += net.Counters.BytesReceived
+		txBytes += net.Counters.BytesSent
+	}
+	metrics.NetworkRxBytes = rxBytes
+	metrics.NetworkTxBytes = txBytes
+
+	// CPU 与带宽都是累计值：与上次采样差分出速率。
+	d.mu.Lock()
+	previous, ok := d.samples[inst.ID]
+	d.samples[inst.ID] = incusSample{cpuTime: state.CPU.Usage, rx: rxBytes, tx: txBytes, at: metrics.CollectedAt}
+	d.mu.Unlock()
+	if ok {
+		seconds := metrics.CollectedAt.Sub(previous.at).Seconds()
+		if seconds > 0 && state.CPU.Usage >= previous.cpuTime {
+			cores := inst.Spec.CPU
+			if cores < 1 {
+				cores = 1
+			}
+			metrics.CPUPercent = float64(state.CPU.Usage-previous.cpuTime) / (seconds * 1e9 * float64(cores)) * 100
+		}
+		if seconds > 0 && rxBytes >= previous.rx {
+			metrics.BandwidthRxBps = float64(rxBytes-previous.rx) / seconds
+		}
+		if seconds > 0 && txBytes >= previous.tx {
+			metrics.BandwidthTxBps = float64(txBytes-previous.tx) / seconds
+		}
+	}
+	if metrics.CPUPercent < 0 {
+		metrics.CPUPercent = 0
+	}
+	if metrics.CPUPercent > 100 {
+		metrics.CPUPercent = 100
 	}
 	return metrics, nil
 }
 
 func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
-	status := collectHostNetwork(ctx, inst.Network)
 	name := resourceName("incus", inst)
-	if out, err := output(ctx, d.cli(), "exec", name, "--", "ip", "-o", "addr", "show"); err == nil {
-		guest := parseIPCommand(string(out))
-		if len(guest) > 0 {
-			status.Interfaces = guest
-			status.Reachable = true
-			status.Error = ""
+	status := protocol.NetworkStatus{CheckedAt: time.Now().UTC()}
+	state, err := d.queryState(ctx, name)
+	if err != nil {
+		status.Error = "实例未运行或状态不可读"
+		return status, nil
+	}
+	reachable := false
+	for ifaceName, net := range state.Network {
+		item := protocol.NetworkInterface{Name: ifaceName, MAC: net.HWAddr, State: net.State}
+		if item.State == "" {
+			item.State = "up"
 		}
+		for _, addr := range net.Addresses {
+			// 只显示全局地址：local/link scope 是环回与链路本地。
+			if addr.Scope != "global" {
+				continue
+			}
+			if addr.Family == "inet" {
+				item.IPv4 = append(item.IPv4, addr.Address)
+			} else {
+				item.IPv6 = append(item.IPv6, addr.Address)
+			}
+		}
+		item.RxBytes = net.Counters.BytesReceived
+		item.TxBytes = net.Counters.BytesSent
+		if len(item.IPv4) > 0 || len(item.IPv6) > 0 {
+			reachable = true
+		}
+		status.Interfaces = append(status.Interfaces, item)
+	}
+	status.Reachable = reachable
+	if !reachable {
+		status.Error = "实例网卡已连接但未获取到全局 IP"
 	}
 	return status, nil
 }
