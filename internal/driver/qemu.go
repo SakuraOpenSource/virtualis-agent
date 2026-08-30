@@ -105,6 +105,14 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 		PrepareDiskFile(isoPath)
 	}
 
+	// NAT 模式且有本地系统盘：注入 guest 引导（运行时自动探测网卡 + DHCP、
+	// 面板生成的 root 密码）。ISO 引导的空盘挂不出根分区，内部静默跳过。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat && isoPath == "" {
+		if err := InjectGuestBootstrap(ctx, diskPath, inst.RootPassword); err != nil {
+			log.Printf("实例 %d guest 引导注入跳过: %v", inst.ID, err)
+		}
+	}
+
 	// NAT 模式：派生确定性 MAC 并在 libvirt 网络里做静态 DHCP 保留，
 	// 让实例每次都拿到同一 IP，NAT 映射的目标地址才稳定。保留失败
 	// （老版本 libvirt 等）不阻塞创建，映射走动态解析回退。

@@ -154,8 +154,16 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// 面板生成的 root 密码：QEMU 在 Create 内写盘；容器直接 exec 注入。
+	// 失败只记日志，不阻塞创建（可稍后经 /password 重试）。
+	if instance.RootPassword != "" && d.Name() != "qemu" {
+		if err := d.SetRootPassword(r.Context(), &instance, instance.RootPassword); err != nil {
+			log.Printf("实例 %d 初始 root 密码注入失败: %v", instance.ID, err)
+		}
+	}
 	instance.Driver = d.Name()
 	instance.Status = driver.StatusStopped
+	instance.RootPassword = ""
 	s.mu.Lock()
 	s.instances[instance.ID] = instance
 	s.mu.Unlock()

@@ -53,6 +53,9 @@ type Instance struct {
 	// NATMappings 是主控落库的期望清单，被控开机时据此配置 DNAT，
 	// 关机/删除时清除。整表下发，由被控幂等对账。
 	NATMappings []NATMapping `json:"nat_mappings,omitempty"`
+	// RootPassword 只在创建请求里出现：agent 把它写进系统盘（QEMU）或
+	// 直接 chpasswd（容器），之后不再传输，也不出现在状态回包中。
+	RootPassword string `json:"root_password,omitempty"`
 }
 
 type Metrics struct {
