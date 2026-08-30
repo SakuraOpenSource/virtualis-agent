@@ -67,7 +67,21 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 			return fmt.Errorf("导入离线镜像失败: %w", err)
 		}
 	}
-	args := []string{"launch", alias, name}
+	// NAT 模式保留静态地址（dnsmasq 静态租约），NAT 映射目标才稳定。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
+		if inst.Network.IPv4 == "" {
+			if reserved, _ := natSlotIP(inst); reserved != "" {
+				inst.Network.IPv4 = reserved
+			}
+		}
+	}
+	// 每实例一个专用 profile 承载网络/资源限制：launch 的 -d 简写在
+	// Incus 6 上解析不可靠，profile device add 的位置参数语法最稳。
+	profile := fmt.Sprintf("virtualis-p-%d", inst.ID)
+	if err := d.ensureProfile(ctx, profile, inst.Network); err != nil {
+		return err
+	}
+	args := []string{"launch", alias, name, "-p", profile}
 	if inst.Type == "vm" {
 		args = append(args, "--vm")
 	}
@@ -77,23 +91,49 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	if inst.Spec.MemoryMB > 0 {
 		args = append(args, "-c", fmt.Sprintf("limits.memory=%dMiB", inst.Spec.MemoryMB))
 	}
-	// NAT 模式保留静态地址（dnsmasq 静态租约），NAT 映射目标才稳定。
-	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
-		if inst.Network.IPv4 == "" {
-			if reserved, _ := natSlotIP(inst); reserved != "" {
-				inst.Network.IPv4 = reserved
-			}
-		}
-	}
-	// 网络在 launch 时一次性声明，避免先起在默认网络再迁移带来的抖动。
-	netArgs := incusDeviceArgs(inst.Network, inst)
-	if len(netArgs) > 0 {
-		args = append(args, netArgs...)
-	}
 	if err := run(ctx, d.cli(), args...); err != nil {
 		return err
 	}
 	d.ensureImageAliasCleaned(ctx, alias)
+	return nil
+}
+
+// ensureProfile 建立实例专用 profile 并按网络模式写入 eth0/root 设备。
+// 幂等：profile 已存在时仅重建设备定义。
+func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig) error {
+	if err := run(ctx, d.cli(), "profile", "create", profile); err != nil && !contains(err.Error(), "already exists") {
+		return fmt.Errorf("创建实例 profile 失败: %w", err)
+	}
+	// 从默认 profile 继承 root 磁盘；已存在先移除再添加（幂等重建）。
+	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
+	if err := run(ctx, d.cli(), "profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"); err != nil {
+		return fmt.Errorf("配置 root 磁盘失败: %w", err)
+	}
+	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "eth0")
+	mode := NormalizeNetworkMode(network.Mode)
+	if mode == NetworkModeNone {
+		if err := run(ctx, d.cli(), "profile", "device", "add", profile, "eth0", "nic", "nictype=none"); err != nil {
+			return fmt.Errorf("配置网络设备失败: %w", err)
+		}
+		return nil
+	}
+	parent := "incusbr0"
+	if mode == NetworkModeDedicated {
+		target, _, err := dedicatedTarget(network)
+		if err == nil && target != "" {
+			parent = target
+		}
+	}
+	spec := []string{"profile", "device", "add", profile, "eth0", "nic", "nictype=bridged", "parent=" + parent}
+	if network.IPv4 != "" {
+		spec = append(spec, "ipv4.address="+strings.Split(network.IPv4, "/")[0])
+	}
+	if network.MAC != "" {
+		spec = append(spec, "hwaddr="+network.MAC)
+	}
+	if err := run(ctx, d.cli(), spec...); err != nil {
+		return fmt.Errorf("配置网络设备失败: %w", err)
+	}
 	return nil
 }
 
