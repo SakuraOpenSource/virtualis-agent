@@ -196,11 +196,20 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 }
 
 func (d *Incus) Start(ctx context.Context, inst *protocol.Instance) error {
-	return run(ctx, d.cli(), "start", resourceName("incus", inst))
+	err := run(ctx, d.cli(), "start", resourceName("incus", inst))
+	// launch 创建的实例一落地就在运行，"already running" 视为成功。
+	if err != nil && !contains(err.Error(), "already running") {
+		return err
+	}
+	return nil
 }
 func (d *Incus) Stop(ctx context.Context, inst *protocol.Instance) error {
 	containerVNC.stop(d.Name(), inst)
-	return run(ctx, d.cli(), "stop", resourceName("incus", inst))
+	err := run(ctx, d.cli(), "stop", resourceName("incus", inst))
+	if err != nil && !contains(err.Error(), "not running") {
+		return err
+	}
+	return nil
 }
 func (d *Incus) Restart(ctx context.Context, inst *protocol.Instance) error {
 	return run(ctx, d.cli(), "restart", resourceName("incus", inst))

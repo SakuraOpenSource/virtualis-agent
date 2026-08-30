@@ -169,7 +169,12 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	instance.Driver = d.Name()
-	instance.Status = driver.StatusStopped
+	// Incus 的 launch 创建即运行；按真实状态回写，别想当然。
+	if real, err := d.Status(r.Context(), &instance); err == nil {
+		instance.Status = real
+	} else {
+		instance.Status = driver.StatusStopped
+	}
 	instance.RootPassword = ""
 	s.mu.Lock()
 	s.instances[instance.ID] = instance
