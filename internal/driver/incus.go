@@ -115,6 +115,7 @@ func (d *Incus) ensureImageAliasCleaned(ctx context.Context, alias string) {
 }
 
 func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
+	containerVNC.stop(d.Name(), inst)
 	err := run(ctx, d.cli(), "delete", resourceName("incus", inst), "--force")
 	if err != nil && !contains(err.Error(), "not found") {
 		return err
@@ -126,6 +127,7 @@ func (d *Incus) Start(ctx context.Context, inst *protocol.Instance) error {
 	return run(ctx, d.cli(), "start", resourceName("incus", inst))
 }
 func (d *Incus) Stop(ctx context.Context, inst *protocol.Instance) error {
+	containerVNC.stop(d.Name(), inst)
 	return run(ctx, d.cli(), "stop", resourceName("incus", inst))
 }
 func (d *Incus) Restart(ctx context.Context, inst *protocol.Instance) error {
@@ -135,6 +137,7 @@ func (d *Incus) HardStart(ctx context.Context, inst *protocol.Instance) error {
 	return d.Start(ctx, inst)
 }
 func (d *Incus) HardStop(ctx context.Context, inst *protocol.Instance) error {
+	containerVNC.stop(d.Name(), inst)
 	return run(ctx, d.cli(), "stop", resourceName("incus", inst), "--force")
 }
 func (d *Incus) HardRestart(ctx context.Context, inst *protocol.Instance) error {
@@ -199,9 +202,18 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 	return nil
 }
 
-// VNC：Incus 容器/VM 无原生 TCP VNC，控制台走 incus console。
-func (d *Incus) VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error) {
-	return unsupportedVNC("incus")
+// VNC 返回容器控制台的本地 VNC 端口（Xvfb + xterm + x11vnc 桥接）。
+func (d *Incus) VNC(ctx context.Context, inst *protocol.Instance, _ string) (protocol.VNCInfo, error) {
+	port, err := containerVNC.ensure(ctx, d.Name(), inst,
+		func() bool { s, _ := d.Status(ctx, inst); return s == StatusRunning },
+		func(name string) []string { return []string{d.cli(), "exec", name, "--", "/bin/bash", "-l"} })
+	if err != nil {
+		return protocol.VNCInfo{Available: false, Message: err.Error()}, nil
+	}
+	return protocol.VNCInfo{
+		Available: true, Protocol: "vnc", Host: "127.0.0.1", Port: port,
+		Display: ":" + strconv.Itoa(port-5900), URL: fmt.Sprintf("vnc://127.0.0.1:%d", port),
+	}, nil
 }
 
 func parseMiB(line string) int64 {

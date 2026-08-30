@@ -146,10 +146,6 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if d.Name() == "lxc" && instance.Type == "vm" {
-		writeError(w, http.StatusBadRequest, "LXC 只能创建容器")
-		return
-	}
 	if err := d.Create(r.Context(), &instance); err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
