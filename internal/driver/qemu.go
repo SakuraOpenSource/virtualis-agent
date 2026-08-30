@@ -286,11 +286,27 @@ func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.N
 			ipOutput = leaseOutput
 		}
 	}
-	if len(ipOutput) > 0 {
-		ips := parseQEMUIPs(string(ipOutput))
-		for i := range ips {
-			if i < len(status.Interfaces) {
-				status.Interfaces[i].IPv4 = append(status.Interfaces[i].IPv4, ips[i])
+	// 按 MAC 归位地址：agent 源会列出发客户机内部的所有网卡（含 lo 的
+	// 127.0.0.1），与 domiflist 的 vnetX 顺序对不上，按索引填会张冠李戴。
+	for _, addr := range parseQEMUAddresses(string(ipOutput)) {
+		matched := false
+		for i := range status.Interfaces {
+			if strings.EqualFold(status.Interfaces[i].MAC, addr.MAC) {
+				status.Interfaces[i].IPv4 = append(status.Interfaces[i].IPv4, addr.IPv4...)
+				status.Interfaces[i].IPv6 = append(status.Interfaces[i].IPv6, addr.IPv6...)
+				matched = true
+				break
+			}
+		}
+		// MAC 对不上（lease 源行 MAC 即 domiflist MAC，正常都能对上）时
+		// 兜底塞给第一个还没有地址的接口。
+		if !matched {
+			for i := range status.Interfaces {
+				if len(status.Interfaces[i].IPv4) == 0 && len(status.Interfaces[i].IPv6) == 0 {
+					status.Interfaces[i].IPv4 = append(status.Interfaces[i].IPv4, addr.IPv4...)
+					status.Interfaces[i].IPv6 = append(status.Interfaces[i].IPv6, addr.IPv6...)
+					break
+				}
 			}
 		}
 	}
@@ -487,6 +503,58 @@ func parseQEMUInterfaces(text string) []protocol.NetworkInterface {
 			continue
 		}
 		result = append(result, protocol.NetworkInterface{Name: fields[0], State: "up", MAC: fields[len(fields)-1]})
+	}
+	return result
+}
+
+// qemuAddress 是 domifaddr 输出里一条 MAC→地址 的映射。
+type qemuAddress struct {
+	MAC        string
+	IPv4, IPv6 []string
+}
+
+// parseQEMUAddresses 解析 domifaddr 输出（agent/lease 两个源的表格同构）：
+// 每行 "接口 MAC 协议 地址/前缀"。跳过环回（127.0.0.0/8、::1）与链路本地
+// （fe80::/10），它们会污染"实例是否拿到地址"的判断。
+func parseQEMUAddresses(text string) []qemuAddress {
+	var order []string
+	byMAC := make(map[string]*qemuAddress)
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[0] == "Name" || strings.HasPrefix(fields[0], "-") {
+			continue
+		}
+		mac := strings.ToLower(fields[1])
+		if _, err := net.ParseMAC(mac); err != nil {
+			continue
+		}
+		value := strings.Split(fields[len(fields)-1], "/")[0]
+		ip := net.ParseIP(value)
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			if v4.IsLoopback() {
+				continue
+			}
+		} else if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		entry, ok := byMAC[mac]
+		if !ok {
+			entry = &qemuAddress{MAC: mac}
+			byMAC[mac] = entry
+			order = append(order, mac)
+		}
+		if ip.To4() != nil {
+			entry.IPv4 = append(entry.IPv4, value)
+		} else {
+			entry.IPv6 = append(entry.IPv6, value)
+		}
+	}
+	result := make([]qemuAddress, 0, len(order))
+	for _, mac := range order {
+		result = append(result, *byMAC[mac])
 	}
 	return result
 }
