@@ -161,13 +161,6 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	// 面板生成的 root 密码：QEMU 在 Create 内写盘；容器直接 exec 注入。
-	// 失败只记日志，不阻塞创建（可稍后经 /password 重试）。
-	if instance.RootPassword != "" && d.Name() != "qemu" {
-		if err := d.SetRootPassword(r.Context(), &instance, instance.RootPassword); err != nil {
-			log.Printf("实例 %d 初始 root 密码注入失败: %v", instance.ID, err)
-		}
-	}
 	instance.Driver = d.Name()
 	// Incus 的 launch 创建即运行；按真实状态回写，别想当然。
 	if real, err := d.Status(r.Context(), &instance); err == nil {
@@ -175,11 +168,25 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 	} else {
 		instance.Status = driver.StatusStopped
 	}
-	instance.RootPassword = ""
-	// 创建即应用 NAT 映射：运行态的实例不该等第一次状态查询才通。
-	if instance.Status == driver.StatusRunning {
-		applyOrClearNAT(r.Context(), d, &instance, s, false)
+	// 首次密码注入、IPv4 确认（含 DHCP 竞态兜底）与 NAT 应用都是分钟级
+	// 重活，同步做会拖爆创建请求的超时——丢后台执行，响应立即返回。
+	if instance.RootPassword != "" || instance.Status == driver.StatusRunning {
+		boot := instance
+		bootCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		go func() {
+			defer cancel()
+			if boot.RootPassword != "" && d.Name() != "qemu" {
+				if err := d.SetRootPassword(bootCtx, &boot, boot.RootPassword); err != nil {
+					log.Printf("实例 %d 初始 root 密码注入失败: %v", boot.ID, err)
+				}
+			}
+			boot.RootPassword = ""
+			if boot.Status == driver.StatusRunning {
+				applyOrClearNAT(bootCtx, d, &boot, s, false)
+			}
+		}()
 	}
+	instance.RootPassword = ""
 	s.mu.Lock()
 	s.instances[instance.ID] = instance
 	s.mu.Unlock()
