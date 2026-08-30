@@ -35,7 +35,13 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	}
 	name := resourceName("incus", inst)
 	alias := fmt.Sprintf("virtualis-img-%d", inst.ID)
-	if err := run(ctx, d.cli(), "image", "import", inst.Image.Path, alias); err != nil {
+	// 分割镜像（meta.tar.xz + rootfs.tar.xz / disk.qcow2）传两个文件；
+	// 统一镜像（单 tar）只传 Path。
+	importArgs := []string{"image", "import", inst.Image.Path, alias}
+	if inst.Image.ExtraPath != "" {
+		importArgs = []string{"image", "import", inst.Image.ExtraPath, inst.Image.Path, alias}
+	}
+	if err := run(ctx, d.cli(), importArgs...); err != nil {
 		return fmt.Errorf("导入离线镜像失败: %w", err)
 	}
 	args := []string{"launch", alias, name}

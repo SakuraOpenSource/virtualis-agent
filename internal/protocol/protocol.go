@@ -29,6 +29,8 @@ type Image struct {
 	SizeBytes    int64  `json:"size_bytes,omitempty"`
 	Checksum     string `json:"checksum,omitempty"`
 	Path         string `json:"path,omitempty"`
+	// ExtraPath 是 Incus 分割镜像的 meta.tar.xz 本地路径。
+	ExtraPath string `json:"extra_path,omitempty"`
 }
 
 // NATMapping 是一条 NAT 端口转发：宿主机的 HostPort 转发到实例的

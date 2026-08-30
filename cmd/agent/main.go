@@ -115,7 +115,7 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	instance, upload, filename, cleanup, err := parseInstance(r)
+	instance, upload, filename, extraUpload, extraName, cleanup, err := parseInstance(r)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -140,6 +140,17 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 			instance.Image = &protocol.Image{}
 		}
 		instance.Image.Path = localPath
+	}
+	if extraUpload != nil {
+		extraPath, saveErr := s.saveImage(extraUpload, extraName)
+		if saveErr != nil {
+			writeError(w, http.StatusBadRequest, saveErr.Error())
+			return
+		}
+		if instance.Image == nil {
+			instance.Image = &protocol.Image{}
+		}
+		instance.Image.ExtraPath = extraPath
 	}
 	d, err := s.registry.Resolve(r.Context(), instance.Driver)
 	if err != nil {
@@ -231,7 +242,7 @@ func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id 
 }
 
 func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id uint) {
-	instance, action, upload, filename, cleanup, err := parsePower(r)
+	instance, action, upload, filename, extraUpload, extraName, cleanup, err := parsePower(r)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -260,6 +271,17 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 			instance.Image = &protocol.Image{Driver: instance.Driver, Type: "disk"}
 		}
 		instance.Image.Path = localPath
+	}
+	if extraUpload != nil {
+		extraPath, saveErr := s.saveImage(extraUpload, extraName)
+		if saveErr != nil {
+			writeError(w, http.StatusBadRequest, saveErr.Error())
+			return
+		}
+		if instance.Image == nil {
+			instance.Image = &protocol.Image{}
+		}
+		instance.Image.ExtraPath = extraPath
 	}
 	d, err := s.registry.Resolve(r.Context(), instance.Driver)
 	if err != nil {
@@ -669,56 +691,86 @@ func safeExtension(filename string) string {
 	return ""
 }
 
-func parseInstance(r *http.Request) (protocol.Instance, io.Reader, string, func(), error) {
+func parseInstance(r *http.Request) (protocol.Instance, io.Reader, string, io.Reader, string, func(), error) {
 	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			return protocol.Instance{}, nil, "", nil, err
+			return protocol.Instance{}, nil, "", nil, "", nil, err
 		}
 		var instance protocol.Instance
 		if err := json.Unmarshal([]byte(r.FormValue("instance")), &instance); err != nil {
-			return protocol.Instance{}, nil, "", cleanupMultipart(r), err
+			return protocol.Instance{}, nil, "", nil, "", cleanupMultipart(r), err
 		}
 		file, header, err := r.FormFile("image")
 		if err != nil {
-			return instance, nil, "", cleanupMultipart(r), nil
+			return instance, nil, "", nil, "", cleanupMultipart(r), nil
 		}
-		return instance, file, header.Filename, func() { file.Close(); cleanupMultipart(r) }, nil
+		extraFile, extraHeader, extraErr := r.FormFile("extra")
+		if extraErr != nil {
+			extraFile, extraHeader = nil, nil
+		}
+		cleanup := func() {
+			file.Close()
+			if extraFile != nil {
+				extraFile.Close()
+			}
+			cleanupMultipart(r)
+		}
+		extraName := ""
+		if extraHeader != nil {
+			extraName = extraHeader.Filename
+		}
+		return instance, file, header.Filename, extraFile, extraName, cleanup, nil
 	}
 	var payload struct {
 		Instance protocol.Instance `json:"instance"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		return protocol.Instance{}, nil, "", nil, err
+		return protocol.Instance{}, nil, "", nil, "", nil, err
 	}
-	return payload.Instance, nil, "", nil, nil
+	return payload.Instance, nil, "", nil, "", nil, nil
 }
 
-func parsePower(r *http.Request) (protocol.Instance, string, io.Reader, string, func(), error) {
+func parsePower(r *http.Request) (protocol.Instance, string, io.Reader, string, io.Reader, string, func(), error) {
 	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			return protocol.Instance{}, "", nil, "", nil, err
+			return protocol.Instance{}, "", nil, "", nil, "", nil, err
 		}
 		var payload struct {
 			Action   string            `json:"action"`
 			Instance protocol.Instance `json:"instance"`
 		}
 		if err := json.Unmarshal([]byte(r.FormValue("power")), &payload); err != nil {
-			return protocol.Instance{}, "", nil, "", cleanupMultipart(r), err
+			return protocol.Instance{}, "", nil, "", nil, "", cleanupMultipart(r), err
 		}
 		file, header, err := r.FormFile("image")
 		if err != nil {
-			return payload.Instance, payload.Action, nil, "", cleanupMultipart(r), nil
+			return payload.Instance, payload.Action, nil, "", nil, "", cleanupMultipart(r), nil
 		}
-		return payload.Instance, payload.Action, file, header.Filename, func() { file.Close(); cleanupMultipart(r) }, nil
+		extraFile, extraHeader, extraErr := r.FormFile("extra")
+		if extraErr != nil {
+			extraFile, extraHeader = nil, nil
+		}
+		cleanup := func() {
+			file.Close()
+			if extraFile != nil {
+				extraFile.Close()
+			}
+			cleanupMultipart(r)
+		}
+		extraName := ""
+		if extraHeader != nil {
+			extraName = extraHeader.Filename
+		}
+		return payload.Instance, payload.Action, file, header.Filename, extraFile, extraName, cleanup, nil
 	}
 	var payload struct {
 		Action   string            `json:"action"`
 		Instance protocol.Instance `json:"instance"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		return protocol.Instance{}, "", nil, "", nil, err
+		return protocol.Instance{}, "", nil, "", nil, "", nil, err
 	}
-	return payload.Instance, payload.Action, nil, "", nil, nil
+	return payload.Instance, payload.Action, nil, "", nil, "", nil, nil
 }
 
 func cleanupMultipart(r *http.Request) func() {
