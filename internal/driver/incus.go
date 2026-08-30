@@ -113,6 +113,12 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 		return err
 	}
 	d.ensureImageAliasCleaned(ctx, alias)
+	// 创建时就地确认网络已注册（静态 IPv4 真的拿到手），不留到首次使用。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat && inst.Network.IPv4 != "" {
+		if err := d.ensureContainerIPv4(ctx, name, inst.Network.IPv4); err != nil {
+			log.Printf("实例 %d 容器 IPv4 确认失败: %v", inst.ID, err)
+		}
+	}
 	return nil
 }
 
@@ -398,6 +404,67 @@ func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.
 	return status, nil
 }
 
+// ensureContainerIPv4 确保容器的 eth0 真的拿到了期望的静态 IPv4。
+//
+// Incus 的 dnsmasq 静态租约偶发竞态：profile 配好保留地址，容器首次
+// DHCP 请求却没拿到（lease 表有 STATIC 条目、容器内只有 IPv6 链路本地）。
+// 创建时就地修复而不是留到"第一次启动才发现"：轮询 → 强制重启再轮询 →
+// 最终兜底在容器内直接静态加地址+网关。全部失败才返回错误。
+func (d *Incus) ensureContainerIPv4(ctx context.Context, name, expectIP string) error {
+	if expectIP == "" {
+		return nil
+	}
+	hasIPv4 := func() bool {
+		state, err := d.queryState(ctx, name)
+		if err != nil {
+			return false
+		}
+		net, ok := state.Network["eth0"]
+		if !ok {
+			return false
+		}
+		for _, addr := range net.Addresses {
+			if addr.Family == "inet" && addr.Scope == "global" {
+				return true
+			}
+		}
+		return false
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasIPv4() {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	// DHCP 竞态：重启容器重新走一遍 DHCP。
+	_ = run(ctx, d.cli(), "restart", name, "--force")
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasIPv4() {
+			log.Printf("容器 %s 重启后已获取 IPv4", name)
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	// 最终兜底：容器内直接静态配置（网关取 incusbr0 地址）。
+	gateway, _ := natSlotIPOn("incusbr0", &protocol.Instance{ID: 1})
+	gw := ""
+	if gateway != "" {
+		gw = gateway
+	}
+	ip := strings.Split(expectIP, "/")[0]
+	script := "ip addr add " + ip + "/24 dev eth0 2>/dev/null; ip link set eth0 up"
+	if gw != "" {
+		script += "; ip route replace default via " + gw + " dev eth0"
+	}
+	if err := run(ctx, d.cli(), "exec", name, "--", "sh", "-c", script); err != nil {
+		return fmt.Errorf("静态兜底配置失败: %w", err)
+	}
+	log.Printf("容器 %s DHCP 未就绪，已在容器内静态配置 %s", name, ip)
+	return nil
+}
+
 // SetRootPassword 注入 root 密码并确保 SSH 可用：
 // 1) 容器就绪前 exec 会失败，做有限重试；
 // 2) 精简镜像（如 TUNA default 变体）不带 sshd，检测缺失时经 apt 安装；
@@ -429,8 +496,23 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 	}
 	// sshd 缺失时安装（Debian 系）。失败仅记录，不影响 chpasswd。
 	if exec(ctx, "sh", "-c", "command -v sshd || test -x /usr/sbin/sshd") != nil {
+		// apt 需要出网：先确认 IPv4 就绪（复用创建时的兜底逻辑）。
+		var ipv4 string
+		if state, err := d.queryState(ctx, name); err == nil {
+			for _, addr := range state.Network["eth0"].Addresses {
+				if addr.Family == "inet" && addr.Scope == "global" {
+					ipv4 = addr.Address
+					break
+				}
+			}
+		}
+		if ipv4 == "" && inst.Network.IPv4 != "" {
+			if err := d.ensureContainerIPv4(ctx, name, inst.Network.IPv4); err != nil {
+				log.Printf("实例 %d 安装 sshd 前修复网络失败: %v", inst.ID, err)
+			}
+		}
 		if exec(ctx, "sh", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openssh-server") != nil {
-			log.Printf("实例 %s 安装 openssh-server 失败（镜像可能非 Debian 系）", name)
+			log.Printf("实例 %d 安装 openssh-server 失败（镜像可能非 Debian 系）", inst.ID)
 		}
 	}
 	if err := exec(ctx, "sh", "-c", "echo root:"+password+" | chpasswd"); err != nil {
