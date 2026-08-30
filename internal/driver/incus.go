@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -397,12 +398,47 @@ func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.
 	return status, nil
 }
 
-// SetRootPassword 经 exec 注入 root 密码，容器启动后立即可用。
+// SetRootPassword 注入 root 密码并确保 SSH 可用：
+// 1) 容器就绪前 exec 会失败，做有限重试；
+// 2) 精简镜像（如 TUNA default 变体）不带 sshd，检测缺失时经 apt 安装；
+// 3) 放行 root 密码登录并启动 sshd。
+// 任一环境步骤失败不阻塞密码设置本身（用户可稍后重试/自行安装）。
 func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, password string) error {
 	name := resourceName("incus", inst)
-	if err := run(ctx, d.cli(), "exec", name, "--", "sh", "-c", "echo root:"+password+" | chpasswd"); err != nil {
-		return fmt.Errorf("设置密码失败（实例可能尚未启动完成）: %w", err)
+	exec := func(timeout context.Context, args ...string) error {
+		full := append([]string{"exec", name, "--"}, args...)
+		return run(timeout, d.cli(), full...)
 	}
+	// 容器 init 未完成时 exec 报错：最多等 30 秒。
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(8 * time.Second):
+			}
+		}
+		lastErr = exec(ctx, "true")
+		if lastErr == nil {
+			break
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("设置密码失败（实例可能尚未启动完成）: %w", lastErr)
+	}
+	// sshd 缺失时安装（Debian 系）。失败仅记录，不影响 chpasswd。
+	if exec(ctx, "sh", "-c", "command -v sshd || test -x /usr/sbin/sshd") != nil {
+		if exec(ctx, "sh", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openssh-server") != nil {
+			log.Printf("实例 %s 安装 openssh-server 失败（镜像可能非 Debian 系）", name)
+		}
+	}
+	if err := exec(ctx, "sh", "-c", "echo root:"+password+" | chpasswd"); err != nil {
+		return fmt.Errorf("设置密码失败: %w", err)
+	}
+	// 放行 root 密码登录并拉起 sshd；drop-in 不支持的老配置退回主配置追加。
+	exec(ctx, "sh", "-c", "mkdir -p /etc/ssh/sshd_config.d && echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/99-virtualis.conf")
+	exec(ctx, "sh", "-c", "systemctl enable --now ssh 2>/dev/null || service ssh start 2>/dev/null || /usr/sbin/sshd")
 	return nil
 }
 
