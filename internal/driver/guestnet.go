@@ -26,7 +26,7 @@ import (
 const (
 	guestNetScriptPath  = "/usr/local/sbin/virtualis-net.sh"
 	guestNetServicePath = "/etc/systemd/system/virtualis-net.service"
-	guestNetSSHDropin   = "/etc/ssh/sshd_config.d/99-virtualis.conf"
+	guestNetSSHDropin   = "/etc/ssh/sshd_config.d/00-virtualis.conf"
 )
 
 const guestNetScript = `#!/bin/sh

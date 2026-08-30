@@ -437,7 +437,7 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 		return fmt.Errorf("设置密码失败: %w", err)
 	}
 	// 放行 root 密码登录并拉起 sshd；drop-in 不支持的老配置退回主配置追加。
-	exec(ctx, "sh", "-c", "mkdir -p /etc/ssh/sshd_config.d && echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/99-virtualis.conf")
+	exec(ctx, "sh", "-c", "mkdir -p /etc/ssh/sshd_config.d && echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/00-virtualis.conf")
 	exec(ctx, "sh", "-c", "systemctl enable --now ssh 2>/dev/null || service ssh start 2>/dev/null || /usr/sbin/sshd")
 	return nil
 }
