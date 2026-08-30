@@ -43,8 +43,28 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	if inst.Image.ExtraPath != "" {
 		importArgs = []string{"image", "import", inst.Image.ExtraPath, inst.Image.Path, "--alias", alias}
 	}
-	if err := run(ctx, d.cli(), importArgs...); err != nil && !contains(err.Error(), "already exists") {
-		return fmt.Errorf("导入离线镜像失败: %w", err)
+	if err := run(ctx, d.cli(), importArgs...); err != nil {
+		if !contains(err.Error(), "already exists") {
+			return fmt.Errorf("导入离线镜像失败: %w", err)
+		}
+		// 同 fingerprint 镜像已在本地库（上次失败残留）：把挂在该镜像上的
+		// virtualis alias 指回本次 alias，launch 才有入口。
+		out, listErr := output(ctx, d.cli(), "image", "list", "--format", "csv")
+		if listErr != nil {
+			return fmt.Errorf("导入离线镜像失败: %w", err)
+		}
+		fingerprint := ""
+		for _, line := range strings.Split(string(out), "\n") {
+			cols := strings.Split(line, ",")
+			if len(cols) < 3 || !strings.Contains(cols[0], "virtualis-img-") {
+				continue
+			}
+			fingerprint = cols[2]
+			break
+		}
+		if fingerprint == "" || run(ctx, d.cli(), "image", "alias", "create", alias, fingerprint) != nil {
+			return fmt.Errorf("导入离线镜像失败: %w", err)
+		}
 	}
 	args := []string{"launch", alias, name}
 	if inst.Type == "vm" {
