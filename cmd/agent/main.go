@@ -216,6 +216,8 @@ func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
 		s.metricsInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "network":
 		s.networkInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 3 && parts[1] == "network" && parts[2] == "configure":
+		s.configureNetworkInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "vnc":
 		s.vncInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "nat":
@@ -414,6 +416,141 @@ func (s *agentServer) networkInstance(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"network": network})
+}
+
+// configureNetworkInstance synchronously reconciles guest readiness, runtime
+// network state and NAT. Unlike the read-only /network endpoint, failures are
+// returned with their exact stage and are never silently converted to success.
+func (s *agentServer) configureNetworkInstance(w http.ResponseWriter, r *http.Request, id uint) {
+	var payload struct {
+		Instance protocol.Instance      `json:"instance"`
+		Network  protocol.NetworkConfig `json:"network"`
+		Password string                 `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	if payload.Instance.ID != id {
+		writeError(w, http.StatusBadRequest, "instance id mismatch")
+		return
+	}
+	instance := payload.Instance
+	if payload.Network.Mode != "" {
+		instance.Network = payload.Network
+	}
+	if stored, err := s.storedInstance(id); err == nil {
+		// The master copy is authoritative for network config, mappings and the
+		// password request; the stored copy only fills identity fields after an
+		// agent restart or a partial request.
+		if instance.Name == "" {
+			instance.Name = stored.Name
+		}
+		if instance.Driver == "" {
+			instance.Driver = stored.Driver
+		}
+		if instance.Type == "" {
+			instance.Type = stored.Type
+		}
+		if instance.NATMappings == nil {
+			instance.NATMappings = stored.NATMappings
+		}
+		if instance.Network.Mode == "" {
+			instance.Network = stored.Network
+		}
+	}
+	if instance.Name == "" || instance.Driver == "" {
+		writeError(w, http.StatusBadRequest, "instance identity incomplete")
+		return
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeConfigureError(w, "driver", err, instance.Status, "", protocol.NetworkStatus{})
+		return
+	}
+	log.Printf("实例 %d 配置网络：开始 driver=%s", id, d.Name())
+	if err := d.ConfigureNetwork(r.Context(), &instance); err != nil {
+		writeConfigureError(w, "configure", err, instance.Status, "", protocol.NetworkStatus{})
+		return
+	}
+	status, err := d.Status(r.Context(), &instance)
+	if err != nil {
+		writeConfigureError(w, "status", err, instance.Status, "", protocol.NetworkStatus{})
+		return
+	}
+	instance.Driver, instance.Status = d.Name(), status
+	passwordConfigured := false
+	if payload.Password != "" && d.Name() != "qemu" {
+		log.Printf("实例 %d 配置网络：初始化 SSH", id)
+		if err := d.SetRootPassword(r.Context(), &instance, payload.Password); err != nil {
+			writeConfigureError(w, "ssh", err, status, "", protocol.NetworkStatus{})
+			return
+		}
+		passwordConfigured = true
+	}
+	log.Printf("实例 %d 配置网络：检测运行时网络", id)
+	network, err := d.Network(r.Context(), &instance)
+	if err != nil {
+		writeConfigureError(w, "network", err, status, "", protocol.NetworkStatus{})
+		return
+	}
+	ip := firstNetworkIPv4(network)
+	if status == driver.StatusRunning && ip == "" {
+		err := fmt.Errorf("实例运行中但未获取到全局 IPv4")
+		writeConfigureError(w, "network", err, status, "", network)
+		return
+	}
+	natApplied := 0
+	if status == driver.StatusRunning {
+		log.Printf("实例 %d 配置网络：对账 NAT 映射", id)
+		natApplied, err = driver.ApplyNATRules(r.Context(), d, &instance, 5, 3)
+		if err != nil {
+			writeConfigureError(w, "nat", err, status, ip, network)
+			return
+		}
+	} else {
+		driver.ClearNATRules(r.Context(), id)
+	}
+	instance.RootPassword = ""
+	s.mu.Lock()
+	s.instances[id] = instance
+	s.mu.Unlock()
+	log.Printf("实例 %d 配置网络：完成 status=%s ip=%s nat=%d", id, status, ip, natApplied)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"instance":            instance,
+		"status":              status,
+		"ip":                  ip,
+		"network":             network,
+		"password_configured": passwordConfigured,
+		"ssh_ready":           payload.Password == "" || d.Name() == "qemu" || passwordConfigured,
+		"nat_applied":         natApplied,
+	})
+}
+
+func firstNetworkIPv4(network protocol.NetworkStatus) string {
+	for _, iface := range network.Interfaces {
+		if iface.Name == "lo" {
+			continue
+		}
+		for _, address := range iface.IPv4 {
+			if ip := strings.Split(address, "/")[0]; net.ParseIP(ip) != nil {
+				return ip
+			}
+		}
+	}
+	return ""
+}
+
+func writeConfigureError(w http.ResponseWriter, step string, err error, status, ip string, network protocol.NetworkStatus) {
+	log.Printf("配置实例网络失败 step=%s status=%s ip=%s: %v", step, status, ip, err)
+	writeJSON(w, http.StatusBadGateway, map[string]any{
+		"error":   "instance configuration failed",
+		"step":    step,
+		"detail":  err.Error(),
+		"status":  status,
+		"ip":      ip,
+		"network": network,
+	})
 }
 
 func (s *agentServer) vncInstance(w http.ResponseWriter, r *http.Request, id uint) {

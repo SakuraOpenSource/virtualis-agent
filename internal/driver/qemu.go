@@ -273,6 +273,24 @@ func (d *QEMU) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.M
 	return metrics, nil
 }
 
+// ConfigureNetwork ensures the requested network infrastructure and restarts
+// the guest so the persisted domain definition is active.
+func (d *QEMU) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) error {
+	if err := d.ensureNetwork(ctx, inst); err != nil {
+		return err
+	}
+	status, err := d.Status(ctx, inst)
+	if err != nil {
+		return err
+	}
+	if status == StatusRunning {
+		if err := d.Restart(ctx, inst); err != nil {
+			return fmt.Errorf("重启实例使网络配置生效失败: %w", err)
+		}
+	}
+	return nil
+}
+
 func (d *QEMU) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {
 	name := resourceName("qemu", inst)
 	status := protocol.NetworkStatus{CheckedAt: time.Now().UTC()}

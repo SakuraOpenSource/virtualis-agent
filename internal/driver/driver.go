@@ -34,6 +34,8 @@ type Driver interface {
 	Status(context.Context, *protocol.Instance) (string, error)
 	Metrics(context.Context, *protocol.Instance) (protocol.Metrics, error)
 	Network(context.Context, *protocol.Instance) (protocol.NetworkStatus, error)
+	// ConfigureNetwork reapplies the instance profile/device configuration.
+	ConfigureNetwork(context.Context, *protocol.Instance) error
 	VNC(context.Context, *protocol.Instance, string) (protocol.VNCInfo, error)
 	// SetRootPassword 尝试把 root 密码注入运行中的实例。容器走 exec
 	// chpasswd 立即生效；QEMU 依赖 guest agent，客户机启动完成前会失败，

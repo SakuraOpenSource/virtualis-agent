@@ -122,21 +122,56 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	return nil
 }
 
-// ensureProfile 建立实例专用 profile 并按网络模式写入 eth0/root 设备。
+// ConfigureNetwork rebuilds the instance profile and reapplies it to an
+// existing container. Incus profiles are live for most device changes; a
+// restart makes the new DHCP/static address deterministic.
+func (d *Incus) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) error {
+	name := resourceName("incus", inst)
+	profile := fmt.Sprintf("virtualis-p-%d", inst.ID)
+	if err := d.ensureProfile(ctx, profile, inst.Network, inst); err != nil {
+		return err
+	}
+	if err := run(ctx, d.cli(), "profile", "assign", name, profile); err != nil && !contains(err.Error(), "already assigned") {
+		return fmt.Errorf("应用实例 profile 失败: %w", err)
+	}
+	status, err := d.Status(ctx, inst)
+	if err != nil {
+		return err
+	}
+	if status == StatusRunning {
+		if err := d.Restart(ctx, inst); err != nil {
+			return fmt.Errorf("重启实例使网络配置生效失败: %w", err)
+		}
+	}
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat && inst.Network.IPv4 != "" {
+		if err := d.ensureContainerIPv4(ctx, name, inst.Network.IPv4); err != nil {
+			return fmt.Errorf("确认容器 IPv4 失败: %w", err)
+		}
+	}
+	return nil
+}
+
 // 幂等：profile 已存在时仅重建设备定义。
 func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig, inst *protocol.Instance) error {
 	if err := run(ctx, d.cli(), "profile", "create", profile); err != nil && !contains(err.Error(), "already exists") {
 		return fmt.Errorf("创建实例 profile 失败: %w", err)
 	}
-	// 从默认 profile 继承 root 磁盘；已存在先移除再添加（幂等重建）。
-	// size 是磁盘配额：需要 btrfs/zfs 存储池才生效（dir 池不支持）。
-	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
-	rootArgs := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"}
-	if size := inst.Spec.DiskGB; size > 0 {
-		rootArgs = append(rootArgs, fmt.Sprintf("size=%dGiB", size))
-	}
-	if err := run(ctx, d.cli(), rootArgs...); err != nil {
-		return fmt.Errorf("配置 root 磁盘失败: %w", err)
+	// 从默认 profile 继承 root 磁盘；首次创建时重建设备定义。
+	// 已被实例使用的 profile 不能删除 root（Incus 会拒绝），此时保留
+	// 现有 root 并只更新配额；网络修复必须能在运行中的实例上幂等执行。
+	rootRemoved := run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
+	if rootRemoved == nil {
+		rootArgs := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"}
+		if size := inst.Spec.DiskGB; size > 0 {
+			rootArgs = append(rootArgs, fmt.Sprintf("size=%dGiB", size))
+		}
+		if err := run(ctx, d.cli(), rootArgs...); err != nil {
+			return fmt.Errorf("配置 root 磁盘失败: %w", err)
+		}
+	} else if size := inst.Spec.DiskGB; size > 0 {
+		if err := run(ctx, d.cli(), "profile", "device", "set", profile, "root", fmt.Sprintf("size=%dGiB", size)); err != nil {
+			return fmt.Errorf("更新 root 磁盘配额失败: %w", err)
+		}
 	}
 	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "eth0")
 	mode := NormalizeNetworkMode(network.Mode)
@@ -263,7 +298,7 @@ func (d *Incus) Reinstall(ctx context.Context, inst *protocol.Instance) error {
 func (d *Incus) Status(ctx context.Context, inst *protocol.Instance) (string, error) {
 	out, err := output(ctx, d.cli(), "list", resourceName("incus", inst), "--format", "csv", "-c", "ns")
 	if err != nil {
-		return StatusStopped, nil
+		return "", fmt.Errorf("读取 Incus 实例状态失败: %w", err)
 	}
 	if strings.Contains(strings.ToLower(string(out)), "running") {
 		return StatusRunning, nil
@@ -401,6 +436,27 @@ func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.
 	if !reachable {
 		status.Error = "实例网卡已连接但未获取到全局 IP"
 	}
+	if inst.Network.IPv4 != "" && len(status.Interfaces) > 0 {
+		// Static NAT reservation is authoritative even if Incus reports the
+		// address with a non-global scope during early boot.
+		for i := range status.Interfaces {
+			if status.Interfaces[i].Name == "eth0" {
+				found := false
+				for _, ip := range status.Interfaces[i].IPv4 {
+					if strings.Split(ip, "/")[0] == strings.Split(inst.Network.IPv4, "/")[0] {
+						found = true
+						break
+					}
+				}
+				if !found {
+					status.Interfaces[i].IPv4 = append(status.Interfaces[i].IPv4, strings.Split(inst.Network.IPv4, "/")[0])
+				}
+				status.Reachable = true
+				status.Error = ""
+				break
+			}
+		}
+	}
 	return status, nil
 }
 
@@ -448,11 +504,11 @@ func (d *Incus) ensureContainerIPv4(ctx context.Context, name, expectIP string) 
 		time.Sleep(2 * time.Second)
 	}
 	// 最终兜底：容器内直接静态配置（网关取 incusbr0 地址）。
-	gateway, _ := natSlotIPOn("incusbr0", &protocol.Instance{ID: 1})
-	gw := ""
-	if gateway != "" {
-		gw = gateway
-	}
+	// natSlotIPOn 返回 (guestIP, gatewayIP)，这里必须取第二个值；
+	// 旧代码误用 guestIP（如 10.10.10.101）作网关，会让容器失去外网，
+	// 随后的 openssh-server 安装必然失败。
+	_, gateway := natSlotIPOn("incusbr0", &protocol.Instance{ID: 1})
+	gw := gateway
 	ip := strings.Split(expectIP, "/")[0]
 	script := "ip addr add " + ip + "/24 dev eth0 2>/dev/null; ip link set eth0 up"
 	if gw != "" {
@@ -467,9 +523,9 @@ func (d *Incus) ensureContainerIPv4(ctx context.Context, name, expectIP string) 
 
 // SetRootPassword 注入 root 密码并确保 SSH 可用：
 // 1) 容器就绪前 exec 会失败，做有限重试；
-// 2) 精简镜像（如 TUNA default 变体）不带 sshd，检测缺失时经 apt 安装；
-// 3) 放行 root 密码登录并启动 sshd。
-// 任一环境步骤失败不阻塞密码设置本身（用户可稍后重试/自行安装）。
+// 2) 精简镜像不带 sshd，按发行版包管理器安装；
+// 3) 放行 root 密码登录、校验配置并启动 sshd；
+// 4) 任一步失败都返回错误，绝不能把“仅 chpasswd 成功”冒充为 SSH 可用。
 func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, password string) error {
 	name := resourceName("incus", inst)
 	exec := func(timeout context.Context, args ...string) error {
@@ -492,11 +548,11 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 		}
 	}
 	if lastErr != nil {
-		return fmt.Errorf("设置密码失败（实例可能尚未启动完成）: %w", lastErr)
+		return fmt.Errorf("等待容器初始化失败: %w", lastErr)
 	}
-	// sshd 缺失时安装（Debian 系）。失败仅记录，不影响 chpasswd。
-	if exec(ctx, "sh", "-c", "command -v sshd || test -x /usr/sbin/sshd") != nil {
-		// apt 需要出网：先确认 IPv4 就绪（复用创建时的兜底逻辑）。
+
+	if exec(ctx, "sh", "-c", "command -v sshd >/dev/null 2>&1 || test -x /usr/sbin/sshd") != nil {
+		// 安装包之前先确保容器有正确的 IPv4 和默认路由。
 		var ipv4 string
 		if state, err := d.queryState(ctx, name); err == nil {
 			for _, addr := range state.Network["eth0"].Addresses {
@@ -508,20 +564,46 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 		}
 		if ipv4 == "" && inst.Network.IPv4 != "" {
 			if err := d.ensureContainerIPv4(ctx, name, inst.Network.IPv4); err != nil {
-				log.Printf("实例 %d 安装 sshd 前修复网络失败: %v", inst.ID, err)
+				return fmt.Errorf("安装 sshd 前配置 IPv4 失败: %w", err)
 			}
 		}
-		if exec(ctx, "sh", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openssh-server") != nil {
-			log.Printf("实例 %d 安装 openssh-server 失败（镜像可能非 Debian 系）", inst.ID)
+		install := "if command -v apt-get >/dev/null 2>&1; then " +
+			"export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openssh-server; " +
+			"elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh; " +
+			"elif command -v dnf >/dev/null 2>&1; then dnf install -y openssh-server; " +
+			"elif command -v yum >/dev/null 2>&1; then yum install -y openssh-server; " +
+			"elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm openssh; " +
+			"else echo 'unsupported package manager' >&2; exit 127; fi"
+		if err := exec(ctx, "sh", "-c", install); err != nil {
+			return fmt.Errorf("安装 SSH 服务失败: %w", err)
 		}
 	}
-	if err := exec(ctx, "sh", "-c", "echo root:"+password+" | chpasswd"); err != nil {
-		return fmt.Errorf("设置密码失败: %w", err)
+	if err := exec(ctx, "sh", "-c", "command -v sshd >/dev/null 2>&1 || test -x /usr/sbin/sshd"); err != nil {
+		return fmt.Errorf("安装后仍找不到 sshd: %w", err)
 	}
-	// 放行 root 密码登录并拉起 sshd；drop-in 不支持的老配置退回主配置追加。
-	exec(ctx, "sh", "-c", "mkdir -p /etc/ssh/sshd_config.d && echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/00-virtualis.conf")
-	exec(ctx, "sh", "-c", "systemctl enable --now ssh 2>/dev/null || service ssh start 2>/dev/null || /usr/sbin/sshd")
+	if err := exec(ctx, "sh", "-c", "echo root:"+shellQuote(password)+" | chpasswd"); err != nil {
+		return fmt.Errorf("设置 root 密码失败: %w", err)
+	}
+	config := "mkdir -p /etc/ssh/sshd_config.d && printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/00-virtualis.conf"
+	if err := exec(ctx, "sh", "-c", config); err != nil {
+		return fmt.Errorf("写入 SSH 登录配置失败: %w", err)
+	}
+	if err := exec(ctx, "sh", "-c", "sshd -t"); err != nil {
+		return fmt.Errorf("SSH 配置校验失败: %w", err)
+	}
+	start := "systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || service ssh start 2>/dev/null || service sshd start 2>/dev/null || /usr/sbin/sshd"
+	if err := exec(ctx, "sh", "-c", start); err != nil {
+		return fmt.Errorf("启动 SSH 服务失败: %w", err)
+	}
+	if err := exec(ctx, "sh", "-c", "pgrep -x sshd >/dev/null 2>&1 || ss -lnt 2>/dev/null | grep -q ':22 '"); err != nil {
+		return fmt.Errorf("SSH 服务启动后未监听 22 端口: %w", err)
+	}
 	return nil
+}
+
+// shellQuote 返回可安全嵌入 POSIX shell 单引号字符串的内容。
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 // VNC 返回容器控制台的本地 VNC 端口（Xvfb + xterm + x11vnc 桥接）。
