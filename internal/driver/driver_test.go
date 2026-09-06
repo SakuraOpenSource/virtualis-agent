@@ -1,11 +1,98 @@
 package driver
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
+
+func TestProfileRootDeviceArgs(t *testing.T) {
+	cases := []struct {
+		name   string
+		exists bool
+		diskGB int
+		want   []string
+	}{
+		{
+			name:   "missing root is added with size",
+			diskGB: 20,
+			want:   []string{"profile", "device", "add", "p-1", "root", "disk", "path=/", "pool=default", "size=20GiB"},
+		},
+		{
+			name:   "existing root is updated",
+			exists: true,
+			diskGB: 20,
+			want:   []string{"profile", "device", "set", "p-1", "root", "size=20GiB"},
+		},
+		{
+			name:   "existing root without quota is unchanged",
+			exists: true,
+			want:   nil,
+		},
+		{
+			name: "missing root without quota is still added",
+			want: []string{"profile", "device", "add", "p-1", "root", "disk", "path=/", "pool=default"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := profileRootDeviceArgs("p-1", tc.exists, tc.diskGB); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("profileRootDeviceArgs() = %#v, want %#v", got, tc.want)
+
+			}
+		})
+	}
+}
+
+func TestProfileHasDevice(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want bool
+		err  bool
+	}{
+		{name: "device exists", data: `{"devices":{"root":{"type":"disk"},"eth0":{"type":"nic"}}}`, want: true},
+		{name: "device missing", data: `{"devices":{"root":{"type":"disk"}}}`, want: false},
+		{name: "empty profile", data: `{"name":"p-1","devices":{}}`, want: false},
+		{name: "missing devices field", data: `{"name":"p-1"}`, want: false},
+		{name: "malformed profile", data: `{`, err: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := profileHasDevice([]byte(tc.data), "eth0")
+			if (err != nil) != tc.err {
+				t.Fatalf("profileHasDevice() error = %v, want error %v", err, tc.err)
+			}
+			if err == nil && got != tc.want {
+				t.Fatalf("profileHasDevice() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProfileDeviceExistsPropagatesCommandErrors(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "incus")
+	script := "#!/bin/sh\nprintf 'profile unavailable' >&2\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+
+	_, err := profileDeviceExists(context.Background(), "incus", "p-1", "root")
+	if err == nil || !strings.Contains(err.Error(), "profile unavailable") {
+		t.Fatalf("profileDeviceExists() error = %v, want command error", err)
+	}
+}
 
 func TestNormalizeNetworkMode(t *testing.T) {
 	cases := map[string]string{

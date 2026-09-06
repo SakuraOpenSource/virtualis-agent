@@ -156,24 +156,34 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	if err := run(ctx, d.cli(), "profile", "create", profile); err != nil && !contains(err.Error(), "already exists") {
 		return fmt.Errorf("创建实例 profile 失败: %w", err)
 	}
-	// 从默认 profile 继承 root 磁盘；首次创建时重建设备定义。
-	// 已被实例使用的 profile 不能删除 root（Incus 会拒绝），此时保留
-	// 现有 root 并只更新配额；网络修复必须能在运行中的实例上幂等执行。
-	rootRemoved := run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
-	if rootRemoved == nil {
-		rootArgs := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"}
-		if size := inst.Spec.DiskGB; size > 0 {
-			rootArgs = append(rootArgs, fmt.Sprintf("size=%dGiB", size))
+	// Incus 创建的空 profile 不会继承 default，root 可能根本不存在。
+	// 先读取设备清单：存在才 set，不存在就 add；不能把任意 remove 失败
+	// 误判为“设备已存在”（这正是 profile device doesn't exist 的根因）。
+	rootExists, err := profileDeviceExists(ctx, d.cli(), profile, "root")
+	if err != nil {
+		return fmt.Errorf("读取 profile root 设备失败: %w", err)
+	}
+	if rootExists {
+		if args := profileRootDeviceArgs(profile, true, inst.Spec.DiskGB); len(args) > 0 {
+			if err := run(ctx, d.cli(), args...); err != nil {
+				return fmt.Errorf("更新 root 磁盘配额失败: %w", err)
+			}
 		}
+	} else {
+		rootArgs := profileRootDeviceArgs(profile, false, inst.Spec.DiskGB)
 		if err := run(ctx, d.cli(), rootArgs...); err != nil {
 			return fmt.Errorf("配置 root 磁盘失败: %w", err)
 		}
-	} else if size := inst.Spec.DiskGB; size > 0 {
-		if err := run(ctx, d.cli(), "profile", "device", "set", profile, "root", fmt.Sprintf("size=%dGiB", size)); err != nil {
-			return fmt.Errorf("更新 root 磁盘配额失败: %w", err)
+	}
+	eth0Exists, err := profileDeviceExists(ctx, d.cli(), profile, "eth0")
+	if err != nil {
+		return fmt.Errorf("读取 profile eth0 设备失败: %w", err)
+	}
+	if eth0Exists {
+		if err := run(ctx, d.cli(), "profile", "device", "remove", profile, "eth0"); err != nil {
+			return fmt.Errorf("移除旧网络设备失败: %w", err)
 		}
 	}
-	_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "eth0")
 	mode := NormalizeNetworkMode(network.Mode)
 	if mode == NetworkModeNone {
 		if err := run(ctx, d.cli(), "profile", "device", "add", profile, "eth0", "nic", "nictype=none"); err != nil {
@@ -199,6 +209,49 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		return fmt.Errorf("配置网络设备失败: %w", err)
 	}
 	return nil
+}
+
+// profileRootDeviceArgs chooses add for a missing root device and set only
+// when an existing root has a new disk quota.
+func profileRootDeviceArgs(profile string, exists bool, diskGB int) []string {
+	if exists {
+		if diskGB <= 0 {
+			return nil
+		}
+		return []string{"profile", "device", "set", profile, "root", fmt.Sprintf("size=%dGiB", diskGB)}
+	}
+	args := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"}
+	if diskGB > 0 {
+		args = append(args, fmt.Sprintf("size=%dGiB", diskGB))
+	}
+	return args
+}
+
+// profileHasDevice parses a profile JSON document. A missing devices map or
+// device is a valid "not found" result; malformed JSON is a real error.
+func profileHasDevice(data []byte, device string) (bool, error) {
+	var profileData struct {
+		Devices map[string]json.RawMessage `json:"devices"`
+	}
+	if err := json.Unmarshal(data, &profileData); err != nil {
+		return false, fmt.Errorf("解析 profile 设备失败: %w", err)
+	}
+	_, ok := profileData.Devices[device]
+	return ok, nil
+}
+
+// profileDeviceExists checks a profile device without relying on error text
+// from a mutating remove command.
+func profileDeviceExists(ctx context.Context, cli, profile, device string) (bool, error) {
+	out, err := output(ctx, cli, "profile", "show", profile, "--format", "json")
+	if err != nil {
+		message := strings.TrimSpace(string(out))
+		if message != "" {
+			return false, fmt.Errorf("profile show 失败: %w: %s", err, message)
+		}
+		return false, fmt.Errorf("profile show 失败: %w", err)
+	}
+	return profileHasDevice(out, device)
 }
 
 // incusDeviceArgs 把网络配置翻译成 launch 可用的 -d 参数。
