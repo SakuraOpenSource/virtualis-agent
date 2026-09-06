@@ -220,8 +220,21 @@ func listNATRules(tag string) []natRule {
 }
 
 func deleteNATRule(ctx context.Context, rule natRule) {
-	args := append([]string{"-t", rule.table, "-D", rule.chain}, rule.spec...)
+	args := append([]string{"-t", rule.table, "-D", rule.chain}, unquoteSpec(rule.spec)...)
 	_ = run(ctx, "iptables", args...)
+}
+
+// unquoteSpec 还原 iptables-save 的转义：comment 等参数值会被包上双引号，
+// 直接把带引号的 token 传给 iptables -D 会因精确匹配失败而删不掉规则。
+func unquoteSpec(spec []string) []string {
+	out := make([]string, len(spec))
+	for i, item := range spec {
+		if len(item) >= 2 && strings.HasPrefix(item, `"`) && strings.HasSuffix(item, `"`) {
+			item = item[1 : len(item)-1]
+		}
+		out[i] = item
+	}
+	return out
 }
 
 // ensureRule 存在即跳过（-C），缺失才追加（-A）。

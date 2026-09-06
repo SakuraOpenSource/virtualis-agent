@@ -60,6 +60,8 @@ func TestProfileHasDevice(t *testing.T) {
 		{name: "device missing", data: `{"devices":{"root":{"type":"disk"}}}`, want: false},
 		{name: "empty profile", data: `{"name":"p-1","devices":{}}`, want: false},
 		{name: "missing devices field", data: `{"name":"p-1"}`, want: false},
+		{name: "metadata envelope", data: `{"metadata":{"devices":{"eth0":{"type":"nic"}}}}`, want: true},
+		{name: "metadata envelope missing device", data: `{"metadata":{"devices":{"root":{"type":"disk"}}}}`, want: false},
 		{name: "malformed profile", data: `{`, err: true},
 	}
 	for _, tc := range cases {
@@ -190,5 +192,21 @@ func TestDomainXMLDefaultsToNATWhenModeEmpty(t *testing.T) {
 	xml := domainXML(resourceName("qemu", inst), inst, "/data/images/disk.qcow2", "")
 	if !strings.Contains(xml, "<interface type='network'>") || !strings.Contains(xml, "network='default'") {
 		t.Errorf("空网络模式应默认 NAT 并挂 default 网络:\n%s", xml)
+	}
+}
+
+func TestUnquoteSpecStripsSaveQuotes(t *testing.T) {
+	spec := []string{"-m", "comment", "--comment", `"virtualis:36"`, "--dport", "20017"}
+	got := unquoteSpec(spec)
+	want := []string{"-m", "comment", "--comment", "virtualis:36", "--dport", "20017"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("token %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+	// 没有引号的 token 原样保留。
+	plain := unquoteSpec([]string{"-p", "tcp"})
+	if plain[0] != "-p" || plain[1] != "tcp" {
+		t.Fatalf("plain spec 被误改: %v", plain)
 	}
 }

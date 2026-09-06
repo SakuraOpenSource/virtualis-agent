@@ -230,26 +230,41 @@ func profileRootDeviceArgs(profile string, exists bool, diskGB int) []string {
 // profileHasDevice parses a profile JSON document. A missing devices map or
 // device is a valid "not found" result; malformed JSON is a real error.
 func profileHasDevice(data []byte, device string) (bool, error) {
-	var profileData struct {
+	// `incus query /1.0/profiles/<name>` 可能直出对象，也可能带 metadata
+	// 信封；`profile show` 在部分 Incus 版本不支持 --format，因此统一走
+	// query。两种形态都兼容。
+	var direct struct {
 		Devices map[string]json.RawMessage `json:"devices"`
 	}
-	if err := json.Unmarshal(data, &profileData); err != nil {
+	if err := json.Unmarshal(data, &direct); err != nil {
 		return false, fmt.Errorf("解析 profile 设备失败: %w", err)
 	}
-	_, ok := profileData.Devices[device]
+	if direct.Devices != nil {
+		_, ok := direct.Devices[device]
+		return ok, nil
+	}
+	var envelope struct {
+		Metadata struct {
+			Devices map[string]json.RawMessage `json:"devices"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false, fmt.Errorf("解析 profile 设备失败: %w", err)
+	}
+	_, ok := envelope.Metadata.Devices[device]
 	return ok, nil
 }
 
 // profileDeviceExists checks a profile device without relying on error text
 // from a mutating remove command.
 func profileDeviceExists(ctx context.Context, cli, profile, device string) (bool, error) {
-	out, err := output(ctx, cli, "profile", "show", profile, "--format", "json")
+	out, err := output(ctx, cli, "query", "/1.0/profiles/"+profile)
 	if err != nil {
 		message := strings.TrimSpace(string(out))
 		if message != "" {
-			return false, fmt.Errorf("profile show 失败: %w: %s", err, message)
+			return false, fmt.Errorf("读取 profile 失败: %w: %s", err, message)
 		}
-		return false, fmt.Errorf("profile show 失败: %w", err)
+		return false, fmt.Errorf("读取 profile 失败: %w", err)
 	}
 	return profileHasDevice(out, device)
 }
@@ -306,6 +321,9 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 	if err != nil && !contains(err.Error(), "not found") {
 		return err
 	}
+	// 实例级 profile 用完即删：否则每次开通都会留下一个 virtualis-p-N
+	// 残留（profile 不随实例删除自动回收）。profile 不存在时忽略报错。
+	_ = run(ctx, d.cli(), "profile", "delete", fmt.Sprintf("virtualis-p-%d", inst.ID))
 	return nil
 }
 
@@ -567,11 +585,26 @@ func (d *Incus) ensureContainerIPv4(ctx context.Context, name, expectIP string) 
 	if gw != "" {
 		script += "; ip route replace default via " + gw + " dev eth0"
 	}
+	// 静态路径没有 DHCP 下发的 DNS：不配置会导致 apt 解析域名失败
+	// （openssh 安装必然失败）。优先交给 systemd-resolved 管理，
+	// 同时直接写 resolv.conf 兜底精简镜像。
+	if gw != "" {
+		script += "; resolvectl dns eth0 " + gw + " 2>/dev/null || true"
+	}
+	script += "; printf 'nameserver " + mapNonEmpty(gw, "223.5.5.5") + "\nnameserver 114.114.114.114\n' > /etc/resolv.conf 2>/dev/null || true"
 	if err := run(ctx, d.cli(), "exec", name, "--", "sh", "-c", script); err != nil {
 		return fmt.Errorf("静态兜底配置失败: %w", err)
 	}
 	log.Printf("容器 %s DHCP 未就绪，已在容器内静态配置 %s", name, ip)
 	return nil
+}
+
+// mapNonEmpty 空值兜底。
+func mapNonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 // SetRootPassword 注入 root 密码并确保 SSH 可用：
@@ -644,7 +677,11 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 	if err := exec(ctx, "sh", "-c", "sshd -t"); err != nil {
 		return fmt.Errorf("SSH 配置校验失败: %w", err)
 	}
-	start := "systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || service ssh start 2>/dev/null || service sshd start 2>/dev/null || /usr/sbin/sshd"
+	// ssh 必须在 chpasswd + drop-in 全部就位后（重）启动：实测镜像自带的
+	// ssh.service 若在容器刚启动、shadow/配置尚未就绪时被拉起，会一直以
+	// PAM authentication failure 拒绝 root 密码（非 root 不受影响），只有
+	// 重启 sshd 进程才能恢复。restart 对未启动的 ssh 同样生效。
+	start := "systemctl enable ssh 2>/dev/null; systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || /usr/sbin/sshd"
 	if err := exec(ctx, "sh", "-c", start); err != nil {
 		return fmt.Errorf("启动 SSH 服务失败: %w", err)
 	}

@@ -40,6 +40,29 @@ type agentServer struct {
 	mu        sync.RWMutex
 	instances map[uint]protocol.Instance
 	metrics   map[uint]protocol.Metrics
+	// bootReady 记录创建/重装后的首次 root 密码注入是否已完成；重启 agent
+	// 后状态丢失，主控的下一次“配置网络”会重新校准，这里只求真实乐观。
+	bootReady map[uint]bool
+}
+
+// markBootReady / bootReadyOf 是 ssh 就绪标记的并发安全读写口。
+func (s *agentServer) markBootReady(id uint, ready bool) {
+	s.mu.Lock()
+	s.bootReady[id] = ready
+	s.mu.Unlock()
+}
+
+func (s *agentServer) bootReadyOf(id uint) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bootReady[id]
+}
+
+// applyBootReady 把就绪标记补进即将返回的实例回包。
+func (s *agentServer) applyBootReady(instance *protocol.Instance) {
+	if instance.ID != 0 {
+		instance.SSHReady = s.bootReadyOf(instance.ID)
+	}
 }
 
 func newAgentServer(token, name, version, dataDir string) *agentServer {
@@ -51,6 +74,7 @@ func newAgentServer(token, name, version, dataDir string) *agentServer {
 		registry:  driver.NewRegistryWithDataDir(dataDir),
 		instances: make(map[uint]protocol.Instance),
 		metrics:   make(map[uint]protocol.Metrics),
+		bootReady: make(map[uint]bool),
 	}
 }
 
@@ -176,8 +200,11 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer cancel()
 			if boot.RootPassword != "" && d.Name() != "qemu" {
+				s.markBootReady(boot.ID, false)
 				if err := d.SetRootPassword(bootCtx, &boot, boot.RootPassword); err != nil {
 					log.Printf("实例 %d 初始 root 密码注入失败: %v", boot.ID, err)
+				} else {
+					s.markBootReady(boot.ID, true)
 				}
 			}
 			boot.RootPassword = ""
@@ -255,6 +282,7 @@ func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id 
 	}
 	s.mu.Lock()
 	delete(s.instances, id)
+	delete(s.bootReady, id)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -312,6 +340,24 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 	}
 	instance.Driver = d.Name()
 	instance.Status = statusForAction(action)
+	// 重装等于换了个全新 guest：与创建路径一致，root 密码注入放后台执行
+	// （apt 安装 sshd 是分钟级重活，不能拖住本次请求），重装出来的系统
+	// 才能开箱即用。QEMU 依赖 guest agent，沿用创建路径的跳过策略。
+	if strings.EqualFold(strings.TrimSpace(action), "reinstall") &&
+		instance.RootPassword != "" && d.Name() != "qemu" {
+		boot := instance
+		bootCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		go func() {
+			defer cancel()
+			s.markBootReady(boot.ID, false)
+			if err := d.SetRootPassword(bootCtx, &boot, boot.RootPassword); err != nil {
+				log.Printf("实例 %d 重装后 root 密码注入失败: %v", boot.ID, err)
+			} else {
+				s.markBootReady(boot.ID, true)
+			}
+		}()
+		instance.RootPassword = ""
+	}
 	applyOrClearNAT(r.Context(), d, &instance, s, false)
 	s.mu.Lock()
 	s.instances[id] = instance
@@ -343,6 +389,7 @@ func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id 
 	// 自愈：域可能在被控升级/重启前就处于运行状态（那时没有 NAT 规则
 	// 逻辑），状态查询是最频繁的请求，借它幂等对账规则，无需重启实例。
 	applyOrClearNAT(r.Context(), d, &instance, s, true)
+	instance.SSHReady = s.bootReadyOf(id)
 	s.mu.Lock()
 	s.instances[id] = instance
 	s.mu.Unlock()

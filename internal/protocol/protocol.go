@@ -58,6 +58,9 @@ type Instance struct {
 	// RootPassword 只在创建请求里出现：agent 把它写进系统盘（QEMU）或
 	// 直接 chpasswd（容器），之后不再传输，也不出现在状态回包中。
 	RootPassword string `json:"root_password,omitempty"`
+	// SSHReady 是被控的回包字段：首次密码注入（含 sshd 可用性校验）完成后
+	// 置 true，主控据此回写实例的 ssh_ready。创建/重装请求里传不传都忽略。
+	SSHReady bool `json:"ssh_ready,omitempty"`
 }
 
 type Metrics struct {
