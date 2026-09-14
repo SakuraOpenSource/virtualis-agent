@@ -169,18 +169,32 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	// Incus 创建的空 profile 不会继承 default，root 可能根本不存在。
 	// 先读取设备清单：存在才 set，不存在就 add；不能把任意 remove 失败
 	// 误判为“设备已存在”（这正是 profile device doesn't exist 的根因）。
+	// 存储池不再硬编码 default：部分节点（如 HK 43.255.159.9）没有 default 池，
+	// 自动选择现存池，否则 launch 会报 Pool not found。
+	pool, err := d.ensureStoragePool(ctx)
+	if err != nil {
+		return err
+	}
 	rootExists, err := profileDeviceExists(ctx, d.cli(), profile, "root")
 	if err != nil {
 		return fmt.Errorf("读取 profile root 设备失败: %w", err)
 	}
 	if rootExists {
-		if args := profileRootDeviceArgs(profile, true, inst.Spec.DiskGB); len(args) > 0 {
+		// 旧 profile 可能挂在已不存在的池上（如 pool=default 但节点只有 s1）：
+		// 此时仅 set size 无法自愈，launch 仍会失败，必须 remove 后按正确池重建。
+		if cur := profileDeviceValue(ctx, d.cli(), profile, "root", "pool"); cur != "" && cur != pool {
+			_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
+			rootExists = false
+		}
+	}
+	if rootExists {
+		if args := profileRootDeviceArgs(profile, true, inst.Spec.DiskGB, pool); len(args) > 0 {
 			if err := run(ctx, d.cli(), args...); err != nil {
 				return fmt.Errorf("更新 root 磁盘配额失败: %w", err)
 			}
 		}
 	} else {
-		rootArgs := profileRootDeviceArgs(profile, false, inst.Spec.DiskGB)
+		rootArgs := profileRootDeviceArgs(profile, false, inst.Spec.DiskGB, pool)
 		if err := run(ctx, d.cli(), rootArgs...); err != nil {
 			return fmt.Errorf("配置 root 磁盘失败: %w", err)
 		}
@@ -202,30 +216,61 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		return nil
 	}
 	parent := "incusbr0"
+	managed := true
 	if mode == NetworkModeDedicated {
 		target, _, err := dedicatedTarget(network)
 		if err == nil && target != "" {
 			parent = target
+		} else if v := strings.TrimSpace(network.Bridge); v != "" {
+			parent = v
 		}
+		// 独立网卡的目标可能是宿主机物理口等非托管桥：只有托管网络才走 network=。
+		managed = d.isManagedNetwork(ctx, parent)
 	}
-	spec := append([]string{"profile", "device", "add", profile, "eth0", "nic"}, incusEth0DeviceArgs(network, parent)...)
+	var spec []string
+	if managed {
+		spec = append([]string{"profile", "device", "add", profile, "eth0", "nic"}, incusEth0DeviceArgs(network, parent)...)
+	} else {
+		spec = append([]string{"profile", "device", "add", profile, "eth0", "nic"}, incusEth0UnmanagedArgs(network, parent)...)
+	}
 	if err := run(ctx, d.cli(), spec...); err != nil {
 		return fmt.Errorf("配置网络设备失败: %w", err)
 	}
 	return nil
 }
 
-// incusEth0DeviceArgs 把网络配置翻译成 profile device add 的设备参数
-// （nictype/parent/ipv4/hwaddr/限速）。抽成纯函数方便单测，ensureProfile
+// incusEth0DeviceArgs 把 NAT/托管网络配置翻译成 profile device add 的设备参数。
+// 托管网络必须用 network= 挂载：nictype=bridged parent= 会被视为非托管桥，
+// 再带 ipv4.address 会在 Incus 6 上直接报错
+// `Cannot use manually specified ipv4.address when using unmanaged parent bridge`
+// (HK 43.255.159.9 实例 47 的失败根因)。抽成纯函数方便单测，ensureProfile
 // 与 ConfigureNetwork 共用，保证创建与重配行为一致。
 func incusEth0DeviceArgs(network protocol.NetworkConfig, parent string) []string {
 	if strings.TrimSpace(parent) == "" {
 		parent = "incusbr0"
 	}
-	args := []string{"nictype=bridged", "parent=" + parent}
+	args := []string{"network=" + parent}
 	if network.IPv4 != "" {
 		args = append(args, "ipv4.address="+strings.Split(network.IPv4, "/")[0])
 	}
+	if network.MAC != "" {
+		args = append(args, "hwaddr="+network.MAC)
+	}
+	if network.BandwidthMbps > 0 {
+		limit := fmt.Sprintf("%dMbit", network.BandwidthMbps)
+		args = append(args, "limits.ingress="+limit, "limits.egress="+limit)
+	}
+	return args
+}
+
+// incusEth0UnmanagedArgs 用于非托管父桥（宿主机物理口、自建 linux bridge 等）：
+// 非托管桥不支持在设备上指定 ipv4.address，IP 由客内静态配置完成，
+// 这里只带 hwaddr 与限速，避免触发与托管桥相同的校验错误。
+func incusEth0UnmanagedArgs(network protocol.NetworkConfig, parent string) []string {
+	if strings.TrimSpace(parent) == "" {
+		parent = "incusbr0"
+	}
+	args := []string{"nictype=bridged", "parent=" + parent}
 	if network.MAC != "" {
 		args = append(args, "hwaddr="+network.MAC)
 	}
@@ -240,27 +285,137 @@ func incusEth0DeviceArgs(network protocol.NetworkConfig, parent string) []string
 // 10.10.10.1/24 创建并开 NAT。不存在且创建失败则返回错误，
 // 上层不再用 10.10.10.x 回退地址盲 launch。
 func (d *Incus) ensureIncusBridge(ctx context.Context) error {
-	if err := run(ctx, d.cli(), "network", "show", "incusbr0"); err == nil {
+	if d.isManagedNetwork(ctx, "incusbr0") {
 		return nil
 	}
+	// 已存在但非托管的同名 linux bridge 会阻止托管网络创建：
+	// 此时不再盲目 network create，而是直接报错让管理员处理，
+	// 避免把“桥名被占用”掩盖成后续 device add 的校验失败。
 	if err := run(ctx, d.cli(), "network", "create", "incusbr0",
 		"ipv4.address=10.10.10.1/24", "ipv4.nat=true",
 		"ipv6.address=auto", "ipv6.nat=true"); err != nil {
+		if contains(err.Error(), "already exists") && d.isManagedNetwork(ctx, "incusbr0") {
+			return nil
+		}
 		return fmt.Errorf("创建默认 NAT 网络 incusbr0 失败: %w", err)
 	}
 	return nil
 }
 
+// isManagedNetwork 判断指定名称是否为 Incus 托管网络。
+// 托管网络必须用 network= 挂载；非托管父桥必须用 nictype=bridged parent= 且不能带 ipv4.address。
+func (d *Incus) isManagedNetwork(ctx context.Context, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	out, err := output(ctx, d.cli(), "network", "show", name)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(strings.ToLower(line))
+		line = strings.ReplaceAll(line, "\"", "")
+		if strings.HasPrefix(line, "managed:") && strings.Contains(line, "true") {
+			return true
+		}
+	}
+	return true
+}
+
+// ensureStoragePool 返回可用的存储池名：优先 default，否则取现存第一个。
+// HK 等节点没有 default 池（只有 s1/incusbr01），硬编码会导致
+// profile root pool=default 残留、launch 报 Pool not found。
+func (d *Incus) ensureStoragePool(ctx context.Context) (string, error) {
+	out, err := output(ctx, d.cli(), "storage", "list", "--format", "csv", "-c", "n")
+	if err == nil {
+		var pools []string
+		for _, line := range strings.Split(string(out), "\n") {
+			name := strings.TrimSpace(strings.Trim(line, "\" "))
+			if name == "" || strings.EqualFold(name, "NAME") {
+				continue
+			}
+			if idx := strings.Index(name, ","); idx >= 0 {
+				name = strings.TrimSpace(strings.Trim(name[:idx], "\" "))
+			}
+			if name != "" {
+				pools = append(pools, name)
+			}
+		}
+		for _, p := range pools {
+			if p == "default" {
+				return "default", nil
+			}
+		}
+		if len(pools) > 0 {
+			return pools[0], nil
+		}
+	}
+	if out2, err2 := output(ctx, d.cli(), "storage", "list"); err2 == nil {
+		if pool := parseStoragePoolTable(string(out2)); pool != "" {
+			return pool, nil
+		}
+	}
+	if err := run(ctx, d.cli(), "storage", "create", "default", "dir"); err == nil {
+		return "default", nil
+	} else if contains(err.Error(), "already exists") {
+		return "default", nil
+	}
+	return "", fmt.Errorf("未找到可用存储池，且自动创建 default 失败: %w", err)
+}
+
+// parseStoragePoolTable 从 `incus storage list` 表格中提取首选池名。
+func parseStoragePoolTable(table string) string {
+	var pools []string
+	for _, line := range strings.Split(table, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "+") {
+			continue
+		}
+		cols := strings.Split(line, "|")
+		if len(cols) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(cols[1])
+		if name == "" || strings.EqualFold(name, "NAME") {
+			continue
+		}
+		pools = append(pools, name)
+	}
+	for _, p := range pools {
+		if p == "default" {
+			return "default"
+		}
+	}
+	if len(pools) > 0 {
+		return pools[0]
+	}
+	return ""
+}
+
+// profileDeviceValue 读取 profile 上某设备的单个键（如 root.pool）。
+// 设备或键不存在返回空串（调用方可按“未知”处理，不报错）。
+func profileDeviceValue(ctx context.Context, cli, profile, device, key string) string {
+	out, err := output(ctx, cli, "profile", "device", "get", profile, device, key)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // profileRootDeviceArgs chooses add for a missing root device and set only
 // when an existing root has a new disk quota.
-func profileRootDeviceArgs(profile string, exists bool, diskGB int) []string {
+func profileRootDeviceArgs(profile string, exists bool, diskGB int, pool string) []string {
+	if strings.TrimSpace(pool) == "" {
+		pool = "default"
+	}
 	if exists {
 		if diskGB <= 0 {
 			return nil
 		}
 		return []string{"profile", "device", "set", profile, "root", fmt.Sprintf("size=%dGiB", diskGB)}
 	}
-	args := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=default"}
+	args := []string{"profile", "device", "add", profile, "root", "disk", "path=/", "pool=" + pool}
 	if diskGB > 0 {
 		args = append(args, fmt.Sprintf("size=%dGiB", diskGB))
 	}
@@ -311,7 +466,7 @@ func profileDeviceExists(ctx context.Context, cli, profile, device string) (bool
 
 // incusDeviceArgs 把网络配置翻译成 launch 可用的 -d 参数。
 //
-// NAT：nic 默认网络（incusbr0），DHCP 自动发地址，共享主机出口 IP。
+// NAT：nic 挂托管网络 incusbr0（network=），DHCP 自动发地址，共享主机出口 IP。
 // 独立 IP：nic bridged 挂到主机网桥；IPv4/gateway/DNS 显式下发给容器。
 // 关闭：nic none。
 func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []string {
@@ -319,9 +474,10 @@ func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []
 	case NetworkModeNone:
 		return []string{"-d", "eth0,nic,nictype=none"}
 	case NetworkModeNat:
-		// 有保留地址时显式声明 bridged 设备，让 dnsmasq 发固定租约。
+		// 托管网络必须用 network=：nictype=bridged parent= 会被视为非托管，
+		// 再带 ipv4.address 会报 unmanaged parent bridge（HK 实例 47 根因）。
 		if network.IPv4 != "" {
-			spec := "eth0,nic,nictype=bridged,parent=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
+			spec := "eth0,nic,network=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
 			if network.MAC != "" {
 				spec += ",hwaddr=" + network.MAC
 			}
@@ -341,9 +497,8 @@ func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []
 	if network.MAC != "" {
 		spec += ",hwaddr=" + network.MAC
 	}
-	if network.IPv4 != "" {
-		spec += ",ipv4.address=" + network.IPv4
-	}
+	// 非托管桥不支持设备级 ipv4.address：IP 由客内静态配置完成，
+	// 这里不再下发，避免触发与 NAT 相同的校验错误。
 	if network.Gateway != "" {
 		spec += ",ipv4.gateway=" + network.Gateway
 	}

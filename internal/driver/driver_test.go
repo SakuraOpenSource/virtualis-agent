@@ -16,36 +16,86 @@ func TestProfileRootDeviceArgs(t *testing.T) {
 		name   string
 		exists bool
 		diskGB int
+		pool   string
 		want   []string
 	}{
 		{
 			name:   "missing root is added with size",
 			diskGB: 20,
+			pool:   "default",
 			want:   []string{"profile", "device", "add", "p-1", "root", "disk", "path=/", "pool=default", "size=20GiB"},
+		},
+		{
+			name:   "missing root uses custom pool",
+			diskGB: 20,
+			pool:   "s1",
+			want:   []string{"profile", "device", "add", "p-1", "root", "disk", "path=/", "pool=s1", "size=20GiB"},
 		},
 		{
 			name:   "existing root is updated",
 			exists: true,
 			diskGB: 20,
+			pool:   "s1",
 			want:   []string{"profile", "device", "set", "p-1", "root", "size=20GiB"},
 		},
 		{
 			name:   "existing root without quota is unchanged",
 			exists: true,
+			pool:   "s1",
 			want:   nil,
 		},
 		{
 			name: "missing root without quota is still added",
+			pool: "default",
+			want: []string{"profile", "device", "add", "p-1", "root", "disk", "path=/", "pool=default"},
+		},
+		{
+			name: "empty pool falls back to default",
 			want: []string{"profile", "device", "add", "p-1", "root", "disk", "path=/", "pool=default"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := profileRootDeviceArgs("p-1", tc.exists, tc.diskGB); !reflect.DeepEqual(got, tc.want) {
+			if got := profileRootDeviceArgs("p-1", tc.exists, tc.diskGB, tc.pool); !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("profileRootDeviceArgs() = %#v, want %#v", got, tc.want)
-
 			}
 		})
+	}
+}
+
+func TestIncusEth0DeviceArgsUsesManagedNetwork(t *testing.T) {
+	got := incusEth0DeviceArgs(protocol.NetworkConfig{IPv4: "10.10.10.147", MAC: "52:54:00:30:00:00", BandwidthMbps: 100}, "incusbr0")
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "network=incusbr0") {
+		t.Fatalf("托管网络应使用 network=incusbr0，得到 %#v", got)
+	}
+	if strings.Contains(joined, "nictype=bridged") || strings.Contains(joined, "parent=") {
+		t.Fatalf("托管网络不应再带 nictype/parent，得到 %#v", got)
+	}
+	if !strings.Contains(joined, "ipv4.address=10.10.10.147") {
+		t.Fatalf("托管网络应保留静态地址，得到 %#v", got)
+	}
+}
+
+func TestIncusEth0UnmanagedArgsOmitsIPv4(t *testing.T) {
+	got := incusEth0UnmanagedArgs(protocol.NetworkConfig{IPv4: "192.168.1.10", MAC: "52:54:00:00:00:01", BandwidthMbps: 50}, "net0")
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "nictype=bridged") || !strings.Contains(joined, "parent=net0") {
+		t.Fatalf("非托管桥应使用 nictype/parent，得到 %#v", got)
+	}
+	if strings.Contains(joined, "ipv4.address") {
+		t.Fatalf("非托管桥不能带 ipv4.address，得到 %#v", got)
+	}
+}
+
+func TestParseStoragePoolTable(t *testing.T) {
+	table := "+-----------+--------+--+\n| NAME | DRIVER |\n+-----------+--------+--+\n| s1 | dir |\n| incusbr01 | dir |\n+-----------+--------+--+"
+	if got := parseStoragePoolTable(table); got != "s1" {
+		t.Fatalf("parseStoragePoolTable() = %q, want %q", got, "s1")
+	}
+	table2 := "+------+--------+\n| NAME | DRIVER |\n+------+--------+\n| default | dir |\n| s1 | dir |\n+------+--------+"
+	if got := parseStoragePoolTable(table2); got != "default" {
+		t.Fatalf("parseStoragePoolTable() = %q, want default", got)
 	}
 }
 
