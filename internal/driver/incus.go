@@ -171,8 +171,20 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	// 误判为“设备已存在”（这正是 profile device doesn't exist 的根因）。
 	// 存储池不再硬编码 default：部分节点（如 HK 43.255.159.9）没有 default 池，
 	// 自动选择现存池，否则 launch 会报 Pool not found。
-	pool, err := d.ensureStoragePool(ctx)
+	// 磁盘配额只在配额型驱动（btrfs/zfs/lvm/ceph）上生效：dir 池会静默
+	// 忽略 size，导致实例内 df 看到宿主机整盘。需要配额时只选配额型池，
+	// 无可用配额池直接报错，绝不静默成功。
+	pool, err := d.ensureStoragePool(ctx, inst.Spec.DiskGB)
 	if err != nil {
+		// 旧 profile 可能已 pinned 到 dir 池：把“静默保留”变成明确报错，
+		// 提示管理员重建配额型池，而不是继续沿用无效配额。
+		if inst.Spec.DiskGB > 0 {
+			if ok, _ := profileDeviceExists(ctx, d.cli(), profile, "root"); ok {
+				if cur := profileDeviceValue(ctx, d.cli(), profile, "root", "pool"); cur != "" {
+					return fmt.Errorf("%w（profile %s 的 root 已绑定存储池 %s，dir 类型不支持磁盘配额，请创建 btrfs/zfs 池后重试）", err, profile, cur)
+				}
+			}
+		}
 		return err
 	}
 	rootExists, err := profileDeviceExists(ctx, d.cli(), profile, "root")
@@ -188,6 +200,18 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		}
 	}
 	if rootExists {
+		// 已有 root 留在原池上：请求配额但生效池为 dir 时 size 会被静默
+		// 忽略，必须报错而不是 set 一个无效值（defense-in-depth：正常
+		// 流程中 ensureStoragePool 在 DiskGB>0 时已只返回配额型池）。
+		if inst.Spec.DiskGB > 0 {
+			if drv := d.storagePoolDriver(ctx, pool); !storageDriverSupportsQuota(drv) {
+				got := drv
+				if got == "" {
+					got = "未知"
+				}
+				return fmt.Errorf("存储池 %s 为 %s 类型，不支持磁盘配额(size)，请创建 btrfs/zfs 池后重试（profile %s 的 root 已绑定该池，未做静默保留）", pool, got, profile)
+			}
+		}
 		if args := profileRootDeviceArgs(profile, true, inst.Spec.DiskGB, pool); len(args) > 0 {
 			if err := run(ctx, d.cli(), args...); err != nil {
 				return fmt.Errorf("更新 root 磁盘配额失败: %w", err)
@@ -324,74 +348,258 @@ func (d *Incus) isManagedNetwork(ctx context.Context, name string) bool {
 	return false
 }
 
-// ensureStoragePool 返回可用的存储池名：优先 default，否则取现存第一个。
+// ensureStoragePool 返回可用的存储池名，并保证磁盘配额真实生效。
+//
+// Incus 的 dir 驱动是宿主机普通目录，root 磁盘的 size=N GiB 会被静默
+// 忽略（实例内 df 看到宿主机整盘）。因此：需要配额（diskGB>0）时优先
+// 选择配额型驱动（btrfs/zfs/lvm/ceph），只有 dir 池时直接报错；
+// 不需要配额（diskGB<=0）时保持旧行为（优先 default，否则第一个），
+// 池不存在时才自动创建 default dir 兜底。
 // HK 等节点没有 default 池（只有 s1/incusbr01），硬编码会导致
 // profile root pool=default 残留、launch 报 Pool not found。
-func (d *Incus) ensureStoragePool(ctx context.Context) (string, error) {
-	out, err := output(ctx, d.cli(), "storage", "list", "--format", "csv", "-c", "n")
-	if err == nil {
-		var pools []string
-		for _, line := range strings.Split(string(out), "\n") {
-			name := strings.TrimSpace(strings.Trim(line, "\" "))
-			if name == "" || strings.EqualFold(name, "NAME") {
-				continue
-			}
-			if idx := strings.Index(name, ","); idx >= 0 {
-				name = strings.TrimSpace(strings.Trim(name[:idx], "\" "))
-			}
-			if name != "" {
-				pools = append(pools, name)
-			}
-		}
-		for _, p := range pools {
-			if p == "default" {
-				return "default", nil
-			}
-		}
-		if len(pools) > 0 {
-			return pools[0], nil
+func (d *Incus) ensureStoragePool(ctx context.Context, diskGB int) (string, error) {
+	pools := d.listStoragePools(ctx)
+	if len(pools) > 0 {
+		if sel, err := selectStoragePool(pools, diskGB); err == nil {
+			return sel, nil
+		} else if diskGB > 0 {
+			// 需要配额但无配额型池：把指名池的明确报错直接返回，
+			// 绝不回退到 dir 静默成功。
+			return "", err
 		}
 	}
-	if out2, err2 := output(ctx, d.cli(), "storage", "list"); err2 == nil {
-		if pool := parseStoragePoolTable(string(out2)); pool != "" {
-			return pool, nil
+	// 自动创建 default dir 只是无配额需求时的最后兜底：需要配额时新建
+	// dir 也承载不了 quota，必须报错让管理员创建配额型池。
+	if diskGB > 0 {
+		if len(pools) == 0 {
+			return "", fmt.Errorf("未找到可用存储池，且请求了磁盘配额(size)：请先创建 btrfs/zfs 存储池后重试（dir 类型不支持磁盘配额）")
+		}
+		// 非空但无配额型池：理论上上面已直接返回，这里防御性兜底。
+		if _, err := selectStoragePool(pools, diskGB); err != nil {
+			return "", err
 		}
 	}
-	if err := run(ctx, d.cli(), "storage", "create", "default", "dir"); err == nil {
+	createErr := run(ctx, d.cli(), "storage", "create", "default", "dir")
+	if createErr == nil {
 		return "default", nil
-	} else if contains(err.Error(), "already exists") {
+	} else if contains(createErr.Error(), "already exists") {
 		return "default", nil
 	}
-	return "", fmt.Errorf("未找到可用存储池，且自动创建 default 失败: %w", err)
+	return "", fmt.Errorf("未找到可用存储池，且自动创建 default 失败: %w", createErr)
 }
 
-// parseStoragePoolTable 从 `incus storage list` 表格中提取首选池名。
-func parseStoragePoolTable(table string) string {
-	var pools []string
-	for _, line := range strings.Split(table, "\n") {
+// storagePool 是存储池名与其驱动的配对（driver 如 dir/btrfs/zfs/lvm/ceph）。
+type storagePool struct {
+	name   string
+	driver string
+}
+
+// storageDriverSupportsQuota 判断存储驱动是否支持 root 磁盘 size 配额。
+// dir 只是宿主机普通目录，size 会被静默忽略；未知/空驱动按不支持处理
+// （fail-closed，避免把“查不到驱动”误判为配额生效）。
+func storageDriverSupportsQuota(driver string) bool {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "btrfs", "zfs", "lvm", "lvmcluster", "ceph":
+		return true
+	default:
+		return false
+	}
+}
+
+// selectStoragePool 在已知池列表中选择：配额型驱动优先于 dir。
+// diskGB>0（需要配额）时只返回配额型池，无配额型池则指名最可能命中的
+// 池给出明确报错；diskGB<=0 时保持旧行为（优先 default，否则第一个）。
+func selectStoragePool(pools []storagePool, diskGB int) (string, error) {
+	if len(pools) == 0 {
+		return "", fmt.Errorf("未找到可用存储池")
+	}
+	if diskGB > 0 {
+		var quota []storagePool
+		for _, p := range pools {
+			if storageDriverSupportsQuota(p.driver) {
+				quota = append(quota, p)
+			}
+		}
+		if len(quota) > 0 {
+			for _, p := range quota {
+				if p.name == "default" {
+					return "default", nil
+				}
+			}
+			return quota[0].name, nil
+		}
+		// 只有 dir（或驱动未知）的池：指名“按旧规则会选中的池”报错，
+		// 而不是静默下发一个无效的 size。
+		fallback := pools[0]
+		for _, p := range pools {
+			if p.name == "default" {
+				fallback = p
+				break
+			}
+		}
+		if strings.TrimSpace(fallback.driver) == "" {
+			return "", fmt.Errorf("存储池 %s 驱动未知，无法确认磁盘配额(size)是否生效，请创建 btrfs/zfs 池后重试", fallback.name)
+		}
+		return "", fmt.Errorf("存储池 %s 为 %s 类型，不支持磁盘配额(size)，请创建 btrfs/zfs 池后重试", fallback.name, fallback.driver)
+	}
+	for _, p := range pools {
+		if p.name == "default" {
+			return "default", nil
+		}
+	}
+	return pools[0].name, nil
+}
+
+// listStoragePools 列出全部存储池及其驱动：先用
+// `storage list --format csv -c n,driver` 一次取齐；老版本不支持 driver
+// 列时回退到表格解析，再逐个 `storage show <pool>` 补驱动。
+func (d *Incus) listStoragePools(ctx context.Context) []storagePool {
+	if out, err := output(ctx, d.cli(), "storage", "list", "--format", "csv", "-c", "n,driver"); err == nil {
+		pools := parseStoragePoolsCSV(string(out))
+		if len(pools) > 0 {
+			d.fillPoolDrivers(ctx, pools)
+		}
+		return pools
+	}
+	// 回退：表格解析（兼容 -c n,driver 不被支持的老版本）。
+	if out, err := output(ctx, d.cli(), "storage", "list"); err == nil {
+		pools := parseStoragePoolTable(string(out))
+		if len(pools) > 0 {
+			d.fillPoolDrivers(ctx, pools)
+		}
+		return pools
+	}
+	return nil
+}
+
+// fillPoolDrivers 对驱动为空的池用 `storage show <pool>` 补齐，补不到的
+// 保持为空（上层按不支持配额处理，不静默放行）。
+func (d *Incus) fillPoolDrivers(ctx context.Context, pools []storagePool) {
+	for i := range pools {
+		if strings.TrimSpace(pools[i].driver) == "" && strings.TrimSpace(pools[i].name) != "" {
+			pools[i].driver = d.storagePoolDriver(ctx, pools[i].name)
+		}
+	}
+}
+
+// storagePoolDriver 查询单个池的驱动（`storage show <pool>` 的 driver 字段），
+// 查不到返回空串。
+func (d *Incus) storagePoolDriver(ctx context.Context, pool string) string {
+	pool = strings.TrimSpace(pool)
+	if pool == "" {
+		return ""
+	}
+	out, err := output(ctx, d.cli(), "storage", "show", pool)
+	if err != nil {
+		return ""
+	}
+	return parseStorageDriver(string(out))
+}
+
+// parseStorageDriver 从 `storage show <pool>` 的 YAML 中提取 driver 字段。
+func parseStorageDriver(text string) string {
+	const prefix = "driver:"
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if len(trimmed) < len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+			continue
+		}
+		value := strings.TrimSpace(trimmed[len(prefix):])
+		if i := strings.Index(value, "#"); i >= 0 {
+			value = strings.TrimSpace(value[:i])
+		}
+		value = strings.Trim(strings.TrimSpace(value), "\"'")
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+	return ""
+}
+
+// parseStoragePoolsCSV 解析 `storage list --format csv -c n,driver` 输出
+// （形如 `"default","btrfs"`），首行 NAME 表头跳过。
+func parseStoragePoolsCSV(out string) []storagePool {
+	var pools []storagePool
+	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "+") {
+		if line == "" {
 			continue
 		}
-		cols := strings.Split(line, "|")
-		if len(cols) < 2 {
-			continue
+		cols := strings.Split(line, ",")
+		clean := func(s string) string {
+			return strings.Trim(strings.TrimSpace(s), "\"'")
 		}
-		name := strings.TrimSpace(cols[1])
+		name := clean(cols[0])
 		if name == "" || strings.EqualFold(name, "NAME") {
 			continue
 		}
-		pools = append(pools, name)
-	}
-	for _, p := range pools {
-		if p == "default" {
-			return "default"
+		driver := ""
+		if len(cols) >= 2 {
+			driver = strings.ToLower(clean(cols[1]))
+			if strings.EqualFold(driver, "DRIVER") {
+				driver = ""
+			}
 		}
+		pools = append(pools, storagePool{name: name, driver: driver})
 	}
-	if len(pools) > 0 {
-		return pools[0]
+	return pools
+}
+
+// parseStoragePoolTable 从 `incus storage list` 表格中提取存储池列表
+// （名称+驱动）：DRIVER 列位置按表头定位，无该列时驱动留空由上层补查。
+func parseStoragePoolTable(table string) []storagePool {
+	nameIdx, driverIdx := 1, -1
+	headerMapped := false
+	var pools []storagePool
+	for _, line := range strings.Split(table, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "+") {
+			continue
+		}
+		cols := strings.Split(trimmed, "|")
+		for i := range cols {
+			cols[i] = strings.TrimSpace(cols[i])
+		}
+		isHeader := false
+		for _, c := range cols {
+			if strings.EqualFold(c, "NAME") {
+				isHeader = true
+				break
+			}
+		}
+		if isHeader {
+			if !headerMapped {
+				headerMapped = true
+				nameIdx, driverIdx = -1, -1
+				for i, c := range cols {
+					switch strings.ToUpper(c) {
+					case "NAME":
+						nameIdx = i
+					case "DRIVER":
+						driverIdx = i
+					}
+				}
+				if nameIdx < 0 {
+					nameIdx = 1
+				}
+			}
+			continue
+		}
+		if nameIdx < 0 || nameIdx >= len(cols) {
+			continue
+		}
+		name := strings.TrimSpace(cols[nameIdx])
+		if name == "" || strings.EqualFold(name, "NAME") {
+			continue
+		}
+		driver := ""
+		if driverIdx >= 0 && driverIdx < len(cols) {
+			driver = strings.ToLower(strings.TrimSpace(cols[driverIdx]))
+		}
+		pools = append(pools, storagePool{name: name, driver: driver})
 	}
-	return ""
+	return pools
 }
 
 // profileDeviceValue 读取 profile 上某设备的单个键（如 root.pool）。
@@ -406,6 +614,8 @@ func profileDeviceValue(ctx context.Context, cli, profile, device, key string) s
 
 // profileRootDeviceArgs chooses add for a missing root device and set only
 // when an existing root has a new disk quota.
+// 注意：size 配额只在配额型驱动上生效，dir 池会静默忽略；调用方
+// （ensureStoragePool/ensureProfile）必须保证 DiskGB>0 时不落到 dir 池。
 func profileRootDeviceArgs(profile string, exists bool, diskGB int, pool string) []string {
 	if strings.TrimSpace(pool) == "" {
 		pool = "default"

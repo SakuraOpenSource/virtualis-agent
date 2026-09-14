@@ -88,14 +88,192 @@ func TestIncusEth0UnmanagedArgsOmitsIPv4(t *testing.T) {
 	}
 }
 
-func TestParseStoragePoolTable(t *testing.T) {
-	table := "+-----------+--------+--+\n| NAME | DRIVER |\n+-----------+--------+--+\n| s1 | dir |\n| incusbr01 | dir |\n+-----------+--------+--+"
-	if got := parseStoragePoolTable(table); got != "s1" {
-		t.Fatalf("parseStoragePoolTable() = %q, want %q", got, "s1")
+func TestParseStoragePoolsCSV(t *testing.T) {
+	out := "\"NAME\",\"DRIVER\"\n\"default\",\"dir\"\n\"fast\",\"btrfs\"\n"
+	pools := parseStoragePoolsCSV(out)
+	if len(pools) != 2 {
+		t.Fatalf("parseStoragePoolsCSV() 数量 = %d, want 2", len(pools))
 	}
-	table2 := "+------+--------+\n| NAME | DRIVER |\n+------+--------+\n| default | dir |\n| s1 | dir |\n+------+--------+"
-	if got := parseStoragePoolTable(table2); got != "default" {
-		t.Fatalf("parseStoragePoolTable() = %q, want default", got)
+	if pools[0].name != "default" || pools[0].driver != "dir" {
+		t.Fatalf("parseStoragePoolsCSV()[0] = %+v, want {default dir}", pools[0])
+	}
+	if pools[1].name != "fast" || pools[1].driver != "btrfs" {
+		t.Fatalf("parseStoragePoolsCSV()[1] = %+v, want {fast btrfs}", pools[1])
+	}
+	// 无引号、大小写混杂也应归一化。
+	plain := parseStoragePoolsCSV("NAME,DRIVER\ns1,ZFS\n")
+	if len(plain) != 1 || plain[0].name != "s1" || plain[0].driver != "zfs" {
+		t.Fatalf("parseStoragePoolsCSV() 大小写归一化失败: %+v", plain)
+	}
+}
+
+func TestParseStoragePoolTable(t *testing.T) {
+	// 表格携带 DRIVER 列：名称与驱动都要提取出来。
+	table := "+-----------+--------+\n| NAME | DRIVER |\n+-----------+--------+\n| s1 | dir |\n| fast | btrfs |\n+-----------+--------+\n"
+	pools := parseStoragePoolTable(table)
+	if len(pools) != 2 {
+		t.Fatalf("parseStoragePoolTable() 数量 = %d, want 2", len(pools))
+	}
+	if pools[0].name != "s1" || pools[0].driver != "dir" {
+		t.Fatalf("parseStoragePoolTable()[0] = %+v, want {s1 dir}", pools[0])
+	}
+	if pools[1].name != "fast" || pools[1].driver != "btrfs" {
+		t.Fatalf("parseStoragePoolTable()[1] = %+v, want {fast btrfs}", pools[1])
+	}
+	// 无 DRIVER 列的老表格：驱动留空，由上层 storage show 补查。
+	legacy := "+---------+\n| NAME |\n+---------+\n| s1 |\n+---------+"
+	legacyPools := parseStoragePoolTable(legacy)
+	if len(legacyPools) != 1 || legacyPools[0].name != "s1" || legacyPools[0].driver != "" {
+		t.Fatalf("parseStoragePoolTable() 老表格解析失败: %+v", legacyPools)
+	}
+	// 旧行为由 selectStoragePool 保持：无配额需求时优先 default，否则第一个。
+	withDefault := []storagePool{{name: "default", driver: "dir"}, {name: "s1", driver: "dir"}}
+	if sel, err := selectStoragePool(withDefault, 0); err != nil || sel != "default" {
+		t.Fatalf("selectStoragePool(无配额) = %q, %v; want default, nil", sel, err)
+	}
+}
+
+func TestStorageDriverSupportsQuota(t *testing.T) {
+	for _, d := range []string{"btrfs", "zfs", "lvm", "lvmcluster", "ceph", "ZFS", " Btrfs "} {
+		if !storageDriverSupportsQuota(d) {
+			t.Errorf("storageDriverSupportsQuota(%q) = false, want true", d)
+		}
+	}
+	for _, d := range []string{"dir", "", "cephfs", "unknown"} {
+		if storageDriverSupportsQuota(d) {
+			t.Errorf("storageDriverSupportsQuota(%q) = true, want false", d)
+		}
+	}
+}
+
+func TestParseStorageDriver(t *testing.T) {
+	yaml := "name: fast\ndriver: btrfs\ndescription: \"\"\nconfig:\n  size: 10GiB\n"
+	if got := parseStorageDriver(yaml); got != "btrfs" {
+		t.Fatalf("parseStorageDriver() = %q, want btrfs", got)
+	}
+	quoted := "name: s1\ndriver: \"dir\" # 行尾注释\n"
+	if got := parseStorageDriver(quoted); got != "dir" {
+		t.Fatalf("parseStorageDriver() = %q, want dir", got)
+	}
+	if got := parseStorageDriver("name: s1\nconfig: {}\n"); got != "" {
+		t.Fatalf("parseStorageDriver() 无 driver 字段应返回空，得到 %q", got)
+	}
+}
+
+func TestSelectStoragePool(t *testing.T) {
+	quota := []storagePool{{name: "default", driver: "dir"}, {name: "fast", driver: "btrfs"}}
+	// 需要配额：配额型池优先于 dir 的 default。
+	if sel, err := selectStoragePool(quota, 20); err != nil || sel != "fast" {
+		t.Fatalf("selectStoragePool(配额) = %q, %v; want fast, nil", sel, err)
+	}
+	// 需要配额且 default 本身就是配额型：仍优先 default。
+	quotaDefault := []storagePool{{name: "default", driver: "zfs"}, {name: "fast", driver: "btrfs"}}
+	if sel, err := selectStoragePool(quotaDefault, 20); err != nil || sel != "default" {
+		t.Fatalf("selectStoragePool(配额+default) = %q, %v; want default, nil", sel, err)
+	}
+	// 只有 dir 池却要配额：指名报错，绝不静默成功。
+	dirOnly := []storagePool{{name: "default", driver: "dir"}, {name: "s1", driver: "dir"}}
+	if sel, err := selectStoragePool(dirOnly, 20); err == nil {
+		t.Fatalf("selectStoragePool(dir+配额) = %q, want error", sel)
+	} else if msg := err.Error(); !strings.Contains(msg, "default") || !strings.Contains(msg, "dir") || !strings.Contains(msg, "不支持磁盘配额") {
+		t.Fatalf("selectStoragePool(dir+配额) 报错缺少指名池/原因: %q", msg)
+	}
+	// 同上：无 default 时指名首个池。
+	dirNoDefault := []storagePool{{name: "s1", driver: "dir"}}
+	if _, err := selectStoragePool(dirNoDefault, 1); err == nil || !strings.Contains(err.Error(), "s1") {
+		t.Fatalf("selectStoragePool(s1 dir+配额) 应指名 s1 报错，得到 %v", err)
+	}
+	// 驱动未知 + 配额：同样报错（fail-closed）。
+	if _, err := selectStoragePool([]storagePool{{name: "s1"}}, 10); err == nil || !strings.Contains(err.Error(), "驱动未知") {
+		t.Fatalf("selectStoragePool(未知驱动+配额) 应报错，得到 %v", err)
+	}
+	// 无配额需求：保持旧行为（优先 default，否则第一个），dir 也可用。
+	if sel, err := selectStoragePool(dirOnly, 0); err != nil || sel != "default" {
+		t.Fatalf("selectStoragePool(无配额) = %q, %v; want default, nil", sel, err)
+	}
+	if sel, err := selectStoragePool(dirNoDefault, 0); err != nil || sel != "s1" {
+		t.Fatalf("selectStoragePool(无配额s1) = %q, %v; want s1, nil", sel, err)
+	}
+	if _, err := selectStoragePool(nil, 20); err == nil {
+		t.Fatal("selectStoragePool(空列表) 应报错")
+	}
+}
+
+// writeFakeIncus 在 PATH 首位放置 fake incus，沿用本包已有的 fake CLI 模式。
+func writeFakeIncus(t *testing.T, script string) {
+	t.Helper()
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "incus")
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+}
+
+func TestListStoragePoolsPrefersQuotaCapable(t *testing.T) {
+	writeFakeIncus(t, "#!/bin/sh\n"+
+		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"list\" ]; then\n"+
+		"  printf '\"NAME\",\"DRIVER\"\\n\"default\",\"dir\"\\n\"fast\",\"btrfs\"\\n'\n"+
+		"  exit 0\n"+
+		"fi\n"+
+		"exit 1\n")
+	d := NewIncus()
+	pools := d.listStoragePools(context.Background())
+	if len(pools) != 2 || pools[0].driver != "dir" || pools[1].driver != "btrfs" {
+		t.Fatalf("listStoragePools() = %+v, want [{default dir} {fast btrfs}]", pools)
+	}
+	if sel, err := selectStoragePool(pools, 20); err != nil || sel != "fast" {
+		t.Fatalf("配额应选中 fast，得到 %q, %v", sel, err)
+	}
+}
+
+func TestListStoragePoolsDirOnlyQuotaFails(t *testing.T) {
+	writeFakeIncus(t, "#!/bin/sh\n"+
+		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"list\" ]; then\n"+
+		"  printf '\"NAME\",\"DRIVER\"\\n\"s1\",\"dir\"\\n'\n"+
+		"  exit 0\n"+
+		"fi\n"+
+		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"create\" ]; then\n"+
+		"  echo 'unexpected storage create' >&2\n"+
+		"  exit 1\n"+
+		"fi\n"+
+		"exit 1\n")
+	d := NewIncus()
+	ctx := context.Background()
+	if _, err := d.ensureStoragePool(ctx, 20); err == nil || !strings.Contains(err.Error(), "不支持磁盘配额") {
+		t.Fatalf("ensureStoragePool(dir+配额) 应明确报错，得到 %v", err)
+	}
+	// 无配额需求时 dir 池照常用，且不需要走到自动创建。
+	if sel, err := d.ensureStoragePool(ctx, 0); err != nil || sel != "s1" {
+		t.Fatalf("ensureStoragePool(dir+无配额) = %q, %v; want s1, nil", sel, err)
+	}
+}
+
+func TestListStoragePoolsTableFallbackWithShow(t *testing.T) {
+	// 老版本不支持 -c n,driver：csv 失败 → 表格（无 DRIVER 列）→ storage show 补驱动。
+	writeFakeIncus(t, "#!/bin/sh\n"+
+		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"list\" ]; then\n"+
+		"  for a in \"$@\"; do\n"+
+		"    if [ \"$a\" = \"--format\" ]; then echo 'Error: unknown column' >&2; exit 1; fi\n"+
+		"  done\n"+
+		"  printf '+------+\\n| NAME |\\n+------+\\n| s1 |\\n+------+\\n'\n"+
+		"  exit 0\n"+
+		"fi\n"+
+		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"show\" ]; then\n"+
+		"  printf 'name: s1\\ndriver: zfs\\nconfig: {}\\n'\n"+
+		"  exit 0\n"+
+		"fi\n"+
+		"exit 1\n")
+	pools := NewIncus().listStoragePools(context.Background())
+	if len(pools) != 1 || pools[0].name != "s1" || pools[0].driver != "zfs" {
+		t.Fatalf("表格回退+show 补驱动失败: %+v", pools)
+	}
+	if sel, err := selectStoragePool(pools, 10); err != nil || sel != "s1" {
+		t.Fatalf("zfs 池应承载配额，得到 %q, %v", sel, err)
 	}
 }
 
