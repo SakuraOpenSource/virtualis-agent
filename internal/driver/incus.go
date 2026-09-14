@@ -320,7 +320,8 @@ func (d *Incus) isManagedNetwork(ctx context.Context, name string) bool {
 			return true
 		}
 	}
-	return true
+	// 没有 managed 字段时按非托管处理（fail-closed）：错误走 network= 分支会在 device add 阶段明确报错，而不是静默用错语法。
+	return false
 }
 
 // ensureStoragePool 返回可用的存储池名：优先 default，否则取现存第一个。
@@ -462,51 +463,6 @@ func profileDeviceExists(ctx context.Context, cli, profile, device string) (bool
 		return false, fmt.Errorf("读取 profile 失败: %w", err)
 	}
 	return profileHasDevice(out, device)
-}
-
-// incusDeviceArgs 把网络配置翻译成 launch 可用的 -d 参数。
-//
-// NAT：nic 挂托管网络 incusbr0（network=），DHCP 自动发地址，共享主机出口 IP。
-// 独立 IP：nic bridged 挂到主机网桥；IPv4/gateway/DNS 显式下发给容器。
-// 关闭：nic none。
-func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []string {
-	switch NormalizeNetworkMode(network.Mode) {
-	case NetworkModeNone:
-		return []string{"-d", "eth0,nic,nictype=none"}
-	case NetworkModeNat:
-		// 托管网络必须用 network=：nictype=bridged parent= 会被视为非托管，
-		// 再带 ipv4.address 会报 unmanaged parent bridge（HK 实例 47 根因）。
-		if network.IPv4 != "" {
-			spec := "eth0,nic,network=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
-			if network.MAC != "" {
-				spec += ",hwaddr=" + network.MAC
-			}
-			if network.BandwidthMbps > 0 {
-				limit := fmt.Sprintf("%dMbit", network.BandwidthMbps)
-				spec += ",limits.ingress=" + limit + ",limits.egress=" + limit
-			}
-			return []string{"-d", spec}
-		}
-		return nil // 不指定时 Incus 用 default 网络的 eth0
-	}
-	parent := "incusbr0"
-	if value := strings.TrimSpace(network.Bridge); value != "" {
-		parent = value
-	}
-	spec := fmt.Sprintf("eth0,nic,nictype=bridged,parent=%s", parent)
-	if network.MAC != "" {
-		spec += ",hwaddr=" + network.MAC
-	}
-	// 非托管桥不支持设备级 ipv4.address：IP 由客内静态配置完成，
-	// 这里不再下发，避免触发与 NAT 相同的校验错误。
-	if network.Gateway != "" {
-		spec += ",ipv4.gateway=" + network.Gateway
-	}
-	if network.BandwidthMbps > 0 {
-		limit := fmt.Sprintf("%dMbit", network.BandwidthMbps)
-		spec += ",limits.ingress=" + limit + ",limits.egress=" + limit
-	}
-	return []string{"-d", spec}
 }
 
 func (d *Incus) ensureImageAliasCleaned(ctx context.Context, alias string) {
