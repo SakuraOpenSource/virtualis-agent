@@ -84,13 +84,23 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	}
 	// NAT 模式保留静态地址（dnsmasq 静态租约），NAT 映射目标才稳定。
 	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
+		if err := d.ensureIncusBridge(ctx); err != nil {
+			return err
+		}
 		if inst.Network.IPv4 == "" {
 			// Incus 容器挂 incusbr0，保留地址必须落在它的子网内。
+			// 网桥不存在时直接失败，不再用硬编码 10.10.10.x 盲 launch。
 			reserved, _ := natSlotIPOn("incusbr0", inst)
 			if reserved == "" {
-				reserved = fmt.Sprintf("10.10.10.%d", 100+int(inst.ID%140))
+				return fmt.Errorf("NAT 网桥 incusbr0 不存在或无 IPv4 地址，无法分配保留 IP")
 			}
 			inst.Network.IPv4 = reserved
+		}
+		// NAT 未指定 MAC 时派生确定性 MAC（与 QEMU 路径一致）：dnsmasq
+		// 静态租约按 MAC 绑定，固定 MAC 可避免重装后新旧随机 MAC 的
+		// 陈旧租约干扰首次 DHCP。
+		if strings.TrimSpace(inst.Network.MAC) == "" {
+			inst.Network.MAC = natMAC(inst)
 		}
 	}
 	// 每实例一个专用 profile 承载网络/资源限制：launch 的 -d 简写在
@@ -198,15 +208,45 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 			parent = target
 		}
 	}
-	spec := []string{"profile", "device", "add", profile, "eth0", "nic", "nictype=bridged", "parent=" + parent}
-	if network.IPv4 != "" {
-		spec = append(spec, "ipv4.address="+strings.Split(network.IPv4, "/")[0])
-	}
-	if network.MAC != "" {
-		spec = append(spec, "hwaddr="+network.MAC)
-	}
+	spec := append([]string{"profile", "device", "add", profile, "eth0", "nic"}, incusEth0DeviceArgs(network, parent)...)
 	if err := run(ctx, d.cli(), spec...); err != nil {
 		return fmt.Errorf("配置网络设备失败: %w", err)
+	}
+	return nil
+}
+
+// incusEth0DeviceArgs 把网络配置翻译成 profile device add 的设备参数
+// （nictype/parent/ipv4/hwaddr/限速）。抽成纯函数方便单测，ensureProfile
+// 与 ConfigureNetwork 共用，保证创建与重配行为一致。
+func incusEth0DeviceArgs(network protocol.NetworkConfig, parent string) []string {
+	if strings.TrimSpace(parent) == "" {
+		parent = "incusbr0"
+	}
+	args := []string{"nictype=bridged", "parent=" + parent}
+	if network.IPv4 != "" {
+		args = append(args, "ipv4.address="+strings.Split(network.IPv4, "/")[0])
+	}
+	if network.MAC != "" {
+		args = append(args, "hwaddr="+network.MAC)
+	}
+	if network.BandwidthMbps > 0 {
+		limit := fmt.Sprintf("%dMbit", network.BandwidthMbps)
+		args = append(args, "limits.ingress="+limit, "limits.egress="+limit)
+	}
+	return args
+}
+
+// ensureIncusBridge 保证 NAT 默认桥 incusbr0 存在：缺失时按
+// 10.10.10.1/24 创建并开 NAT。不存在且创建失败则返回错误，
+// 上层不再用 10.10.10.x 回退地址盲 launch。
+func (d *Incus) ensureIncusBridge(ctx context.Context) error {
+	if err := run(ctx, d.cli(), "network", "show", "incusbr0"); err == nil {
+		return nil
+	}
+	if err := run(ctx, d.cli(), "network", "create", "incusbr0",
+		"ipv4.address=10.10.10.1/24", "ipv4.nat=true",
+		"ipv6.address=auto", "ipv6.nat=true"); err != nil {
+		return fmt.Errorf("创建默认 NAT 网络 incusbr0 失败: %w", err)
 	}
 	return nil
 }
@@ -284,6 +324,10 @@ func incusDeviceArgs(network protocol.NetworkConfig, inst *protocol.Instance) []
 			spec := "eth0,nic,nictype=bridged,parent=incusbr0,ipv4.address=" + strings.Split(network.IPv4, "/")[0]
 			if network.MAC != "" {
 				spec += ",hwaddr=" + network.MAC
+			}
+			if network.BandwidthMbps > 0 {
+				limit := fmt.Sprintf("%dMbit", network.BandwidthMbps)
+				spec += ",limits.ingress=" + limit + ",limits.egress=" + limit
 			}
 			return []string{"-d", spec}
 		}

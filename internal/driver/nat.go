@@ -29,7 +29,7 @@ func hasIPTables() bool { return hasCommand("iptables") }
 // natSlotIP 计算实例在 NAT 网桥子网里的静态保留 IP 与网关（网桥自身地址）。
 // 兼容入口：QEMU/libvirt 用 virbr0，Incus 用 incusbr0，按各自网桥推导。
 //
-// 槽位按实例 ID 确定性分配（100 + id%140 → x.x.x.100-249），避开网桥
+// 槽位按实例 ID 确定性分配（100 + id%140 → x.x.x.100-239），避开网桥
 // 自身的 .1，同一被控上不同实例不会撞号。找不到网桥时返回空。
 func natSlotIP(inst *protocol.Instance) (string, string) {
 	for _, bridge := range []string{"virbr0", "incusbr0"} {

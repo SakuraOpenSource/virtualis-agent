@@ -210,3 +210,42 @@ func TestUnquoteSpecStripsSaveQuotes(t *testing.T) {
 		t.Fatalf("plain spec 被误改: %v", plain)
 	}
 }
+
+func TestIncusEth0DeviceArgsIncludesLimits(t *testing.T) {
+	// NAT + 限速：profile 设备必须带 limits.ingress/egress，否则 Incus 限速不生效。
+	got := strings.Join(incusEth0DeviceArgs(protocol.NetworkConfig{
+		Mode: NetworkModeNat, IPv4: "10.10.10.130", BandwidthMbps: 50,
+	}, "incusbr0"), ",")
+	for _, want := range []string{"nictype=bridged", "parent=incusbr0", "ipv4.address=10.10.10.130", "limits.ingress=50Mbit", "limits.egress=50Mbit"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("NAT 网卡参数缺少 %q: %s", want, got)
+		}
+	}
+	// 不限速时不写 limits（0 即不限，与 omitempty 语义一致）。
+	plain := strings.Join(incusEth0DeviceArgs(protocol.NetworkConfig{
+		Mode: NetworkModeNat, IPv4: "10.10.10.131",
+	}, "incusbr0"), ",")
+	if strings.Contains(plain, "limits.") {
+		t.Errorf("不限速时不应写 limits: %s", plain)
+	}
+	// CIDR 后缀要剥掉，MAC 要透传。
+	withMAC := strings.Join(incusEth0DeviceArgs(protocol.NetworkConfig{
+		Mode: NetworkModeDedicated, IPv4: "192.0.2.10/24", MAC: "52:54:00:00:00:09", BandwidthMbps: 100,
+	}, "br0"), ",")
+	for _, want := range []string{"parent=br0", "ipv4.address=192.0.2.10", "hwaddr=52:54:00:00:00:09", "limits.ingress=100Mbit"} {
+		if !strings.Contains(withMAC, want) {
+			t.Errorf("独立 IP 网卡参数缺少 %q: %s", want, withMAC)
+		}
+	}
+}
+
+func TestIncusDeviceArgsNatIncludesLimits(t *testing.T) {
+	// 无调用者的旧分支同步修复：NAT 有保留地址 + 限速时 -d 参数也要带 limits。
+	args := incusDeviceArgs(protocol.NetworkConfig{
+		Mode: NetworkModeNat, IPv4: "10.10.10.132", BandwidthMbps: 20,
+	}, &protocol.Instance{})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "limits.ingress=20Mbit") || !strings.Contains(joined, "limits.egress=20Mbit") {
+		t.Errorf("NAT -d 参数缺少限速: %v", args)
+	}
+}
