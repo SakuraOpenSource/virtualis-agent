@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -179,44 +180,46 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	// 存储池不再硬编码 default：部分节点（如 HK 43.255.159.9）没有 default 池，
 	// 自动选择现存池，否则 launch 会报 Pool not found。
 	// 磁盘配额只在配额型驱动（btrfs/zfs/lvm/ceph）上生效：dir 池会静默
-	// 忽略 size，导致实例内 df 看到宿主机整盘。需要配额时只选配额型池，
-	// 无可用配额池直接报错，绝不静默成功。
-	pool, err := d.ensureStoragePool(ctx, inst.Spec.DiskGB)
-	if err != nil {
-		// 旧 profile 可能已 pinned 到 dir 池：把“静默保留”变成明确报错，
-		// 提示管理员重建配额型池，而不是继续沿用无效配额。
-		if inst.Spec.DiskGB > 0 {
-			if ok, _ := profileDeviceExists(ctx, d.cli(), profile, "root"); ok {
-				if cur := profileDeviceValue(ctx, d.cli(), profile, "root", "pool"); cur != "" {
-					return fmt.Errorf("%w（profile %s 的 root 已绑定存储池 %s，dir 类型不支持磁盘配额，请创建 btrfs/zfs 池后重试）", err, profile, cur)
-				}
-			}
-		}
-		return err
-	}
 	rootExists, err := profileDeviceExists(ctx, d.cli(), profile, "root")
 	if err != nil {
 		return fmt.Errorf("读取 profile root 设备失败: %w", err)
 	}
+	var pool string
 	if rootExists {
+		// 已有实例：root 留在原池上，绝不迁移（rootfs 就在池里，换池等于丢盘）。
+		pool = profileDeviceValue(ctx, d.cli(), profile, "root", "pool")
 		// 旧 profile 可能挂在已不存在的池上（如 pool=default 但节点只有 s1）：
 		// 此时仅 set size 无法自愈，launch 仍会失败，必须 remove 后按正确池重建。
-		if cur := profileDeviceValue(ctx, d.cli(), profile, "root", "pool"); cur != "" && cur != pool {
+		if pool != "" && !d.storagePoolExists(ctx, pool) {
 			_ = run(ctx, d.cli(), "profile", "device", "remove", profile, "root")
 			rootExists = false
+			pool = ""
+		}
+	}
+	if !rootExists {
+		// 新实例：优先每实例独立 btrfs 回环池（大小=磁盘配额）。独立池上
+		// 容器内 df 看到的就是真实配额、写满被真实拦截；共享池上 df 只能
+		// 显示池大小，用户会误以为配额没生效。独立池建不出再退回共享配额池。
+		if inst.Spec.DiskGB > 0 {
+			if dedicated, derr := d.ensureDedicatedPool(ctx, inst.ID, inst.Spec.DiskGB); derr == nil {
+				pool = dedicated
+			} else {
+				log.Printf("实例 %d 独立存储池创建失败，回退共享池: %v", inst.ID, derr)
+			}
+		}
+		if pool == "" {
+			pool, err = d.ensureStoragePool(ctx, inst.Spec.DiskGB)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	if rootExists {
 		// 已有 root 留在原池上：请求配额但生效池为 dir 时 size 会被静默
-		// 忽略，必须报错而不是 set 一个无效值（defense-in-depth：正常
-		// 流程中 ensureStoragePool 在 DiskGB>0 时已只返回配额型池）。
+		// 忽略，必须报错而不是 set 一个无效值。
 		if inst.Spec.DiskGB > 0 {
-			if drv := d.storagePoolDriver(ctx, pool); !storageDriverSupportsQuota(drv) {
-				got := drv
-				if got == "" {
-					got = "未知"
-				}
-				return fmt.Errorf("存储池 %s 为 %s 类型，不支持磁盘配额(size)，请创建 btrfs/zfs 池后重试（profile %s 的 root 已绑定该池，未做静默保留）", pool, got, profile)
+			if drv := d.storagePoolDriver(ctx, pool); drv != "" && !storageDriverSupportsQuota(drv) {
+				return fmt.Errorf("存储池 %s 为 %s 类型，不支持磁盘配额(size)，请创建 btrfs/zfs 池后重试（profile %s 的 root 已绑定该池，未做静默保留）", pool, drv, profile)
 			}
 		}
 		if args := profileRootDeviceArgs(profile, true, inst.Spec.DiskGB, pool); len(args) > 0 {
@@ -267,7 +270,38 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	if err := run(ctx, d.cli(), spec...); err != nil {
 		return fmt.Errorf("配置网络设备失败: %w", err)
 	}
+	d.ensureLxcfsDevices(ctx, profile)
 	return nil
+}
+
+// lxcfsFiles 是要虚拟化进容器 /proc 的 lxcfs 文件：容器里 free/top 读的
+// meminfo、cpuinfo 等默认是宿主机全局值（cgroup 只做 enforcement 不改
+// 视图），宿主机装了 lxcfs 后把这几个文件按容器 cgroup 呈现，用户才能
+// 看到真实的 256MB 内存 / 0.25 核，而不是宿主机的 31G/12 核。
+var lxcfsFiles = []string{"meminfo", "cpuinfo", "stat", "uptime", "loadavg", "swaps", "diskstats"}
+
+// ensureLxcfsDevices 把 lxcfs 的 /proc 视图以 disk 设备挂进实例 profile。
+// 宿主机没装/没跑 lxcfs 时移除残留设备（源缺失会让实例无法启动）；
+// 已挂对的设备保持不动，整体幂等。挂载在 launch 前进 profile，无需额外重启。
+func (d *Incus) ensureLxcfsDevices(ctx context.Context, profile string) {
+	_, err := os.Stat("/var/lib/lxcfs/proc/meminfo")
+	hostReady := err == nil
+	for _, file := range lxcfsFiles {
+		device := "lxcfs-" + file
+		exists, err := profileDeviceExists(ctx, d.cli(), profile, device)
+		if err != nil {
+			continue
+		}
+		if hostReady {
+			if exists {
+				continue
+			}
+			_ = run(ctx, d.cli(), "profile", "device", "add", profile, device, "disk",
+				"source=/var/lib/lxcfs/proc/"+file, "path=/proc/"+file)
+		} else if exists {
+			_ = run(ctx, d.cli(), "profile", "device", "remove", profile, device)
+		}
+	}
 }
 
 // incusEth0DeviceArgs 把 NAT/托管网络配置翻译成 profile device add 的设备参数。
@@ -353,6 +387,41 @@ func (d *Incus) isManagedNetwork(ctx context.Context, name string) bool {
 	}
 	// 没有 managed 字段时按非托管处理（fail-closed）：错误走 network= 分支会在 device add 阶段明确报错，而不是静默用错语法。
 	return false
+}
+
+// dedicatedPoolName 是实例独立磁盘池名：大小=配额，随实例删除一并清理。
+func dedicatedPoolName(instID uint) string {
+	return fmt.Sprintf("vdisk-%d", instID)
+}
+
+// storagePoolExists 判断存储池是否存在。
+func (d *Incus) storagePoolExists(ctx context.Context, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	return run(ctx, d.cli(), "storage", "info", name) == nil
+}
+
+// ensureDedicatedPool 创建（或复用）实例独立的 btrfs 回环池，池大小=磁盘
+// 配额。宿主机不支持 btrfs（缺 mkfs.btrfs 或建池失败）时返回错误，调用方
+// 回退共享配额型池。
+func (d *Incus) ensureDedicatedPool(ctx context.Context, instID uint, diskGB int) (string, error) {
+	if diskGB <= 0 {
+		return "", fmt.Errorf("未设置磁盘配额")
+	}
+	if !hasCommand("mkfs.btrfs") {
+		return "", fmt.Errorf("宿主机缺少 mkfs.btrfs，无法创建独立磁盘池")
+	}
+	name := dedicatedPoolName(instID)
+	if d.storagePoolExists(ctx, name) {
+		return name, nil
+	}
+	if err := run(ctx, d.cli(), "storage", "create", name, "btrfs",
+		fmt.Sprintf("size=%dGiB", diskGB)); err != nil {
+		return "", fmt.Errorf("创建独立磁盘池 %s 失败: %w", name, err)
+	}
+	return name, nil
 }
 
 // ensureStoragePool 返回可用的存储池名，并保证磁盘配额真实生效。
@@ -726,6 +795,9 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 	// 实例级 profile 用完即删：否则每次开通都会留下一个 virtualis-p-N
 	// 残留（profile 不随实例删除自动回收）。profile 不存在时忽略报错。
 	_ = run(ctx, d.cli(), "profile", "delete", fmt.Sprintf("virtualis-p-%d", inst.ID))
+	// 独立磁盘池随实例清理：池大小=配额，实例没了池就没意义。
+	// 老实例（root 在共享池上）删除 vdisk-N 会报 not found，忽略即可。
+	_ = run(ctx, d.cli(), "storage", "delete", dedicatedPoolName(inst.ID))
 	removeTrafficState(d.dataDir, inst.ID)
 	return nil
 }
