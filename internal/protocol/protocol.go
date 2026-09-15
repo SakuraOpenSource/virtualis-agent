@@ -17,6 +17,9 @@ type NetworkConfig struct {
 	Gateway       string   `json:"gateway,omitempty"`
 	DNS           []string `json:"dns,omitempty"`
 	BandwidthMbps int      `json:"bandwidth_mbps,omitempty"`
+	// TrafficGB 是累计流量配额（GB），0 表示不限。只做计量与断网，
+	// 不翻译成 hypervisor 限速参数（限速仍由 BandwidthMbps 承担）。
+	TrafficGB int `json:"traffic_gb,omitempty"`
 }
 
 type Image struct {
@@ -72,6 +75,11 @@ type Metrics struct {
 	BandwidthRxBps float64   `json:"bandwidth_rx_bps"`
 	BandwidthTxBps float64   `json:"bandwidth_tx_bps"`
 	CollectedAt    time.Time `json:"collected_at"`
+	// TrafficUsedBytes 是本实例累计使用的总流量（rx+tx，持久化累加，
+	// 重启/计数器重置不丢失）。0 表示尚未累积。
+	TrafficUsedBytes uint64 `json:"traffic_used_bytes,omitempty"`
+	// TrafficQuotaExceeded 为 true 表示累计用量已达到配额（quota>0）。
+	TrafficQuotaExceeded bool `json:"traffic_quota_exceeded,omitempty"`
 }
 
 type NetworkInterface struct {

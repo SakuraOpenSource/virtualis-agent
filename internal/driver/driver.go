@@ -64,10 +64,11 @@ type Registry struct {
 }
 
 // NewRegistryWithDataDir 注册全部真实驱动：incus、qemu。
-// dataDir 是被控数据目录，驱动把磁盘与镜像放在 <dataDir>/images 下。
+// dataDir 是被控数据目录，驱动把磁盘与镜像放在 <dataDir>/images 下，
+// 累计流量文件放在 <dataDir>/traffic_<id>.json。
 func NewRegistryWithDataDir(dataDir string) *Registry {
 	r := &Registry{drivers: make(map[string]Driver)}
-	r.Register(NewIncus())
+	r.Register(NewIncusWithDataDir(dataDir))
 	r.Register(NewQEMUWithDataDir(dataDir))
 	return r
 }

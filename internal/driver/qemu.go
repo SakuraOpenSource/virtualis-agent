@@ -156,6 +156,7 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 	d.mu.Lock()
 	delete(d.samples, inst.ID)
 	d.mu.Unlock()
+	removeTrafficState(d.dataDir, inst.ID)
 	return nil
 }
 
@@ -197,10 +198,20 @@ func (d *QEMU) HardRestart(ctx context.Context, inst *protocol.Instance) error {
 	return d.HardStart(ctx, inst)
 }
 func (d *QEMU) Reinstall(ctx context.Context, inst *protocol.Instance) error {
+	// 重装换 guest 不清累计用量：Delete 会清累计文件（真删语义），
+	// 这里先快照、事后恢复（Create 成功与否都恢复，失败也不丢用量）。
+	snapshot := loadTrafficState(d.dataDir, inst.ID)
 	if err := d.Delete(ctx, inst); err != nil {
 		return err
 	}
-	return d.Create(ctx, inst)
+	createErr := d.Create(ctx, inst)
+	if snapshot != (trafficState{}) {
+		mu := trafficLockFor(d.dataDir, inst.ID)
+		mu.Lock()
+		saveTrafficState(d.dataDir, inst.ID, snapshot)
+		mu.Unlock()
+	}
+	return createErr
 }
 
 func (d *QEMU) Status(ctx context.Context, inst *protocol.Instance) (string, error) {
@@ -270,14 +281,121 @@ func (d *QEMU) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.M
 	if metrics.CPUPercent > 100 {
 		metrics.CPUPercent = 100
 	}
+	// 累计流量配额：与 Incus 同一套差分累加逻辑，限速路径不受影响。
+	if used, exceeded := observeTraffic(d.dataDir, inst.ID, inst.Network.TrafficGB, rxBytes, txBytes); true {
+		metrics.TrafficUsedBytes = used
+		metrics.TrafficQuotaExceeded = exceeded
+	}
 	return metrics, nil
+}
+
+// CheckTrafficQuota 返回累计用量与超限状态（只读文件，不查 hypervisor）。
+func (d *QEMU) CheckTrafficQuota(inst *protocol.Instance) (uint64, bool) {
+	st := loadTrafficState(d.dataDir, inst.ID)
+	quota := inst.Network.TrafficGB
+	if quota <= 0 {
+		quota = st.QuotaGB
+	}
+	return st.UsedBytes, TrafficQuotaExceeded(st.UsedBytes, quota)
+}
+
+// TrafficStateOf 暴露断网标记与原始网络，供 agent 主循环做断网/重连。
+func (d *QEMU) TrafficStateOf(id uint) (disconnected bool, original *protocol.NetworkConfig, used uint64, quota int) {
+	st := loadTrafficState(d.dataDir, id)
+	return st.Disconnected, st.OriginalNetwork, st.UsedBytes, st.QuotaGB
+}
+
+// MarkTrafficDisconnected 记录断网动作与原始网络。
+func (d *QEMU) MarkTrafficDisconnected(id uint, original protocol.NetworkConfig, used uint64, quota int) {
+	mu := trafficLockFor(d.dataDir, id)
+	mu.Lock()
+	defer mu.Unlock()
+	st := loadTrafficState(d.dataDir, id)
+	if st.OriginalNetwork == nil {
+		cp := original
+		st.OriginalNetwork = &cp
+	}
+	st.Disconnected = true
+	st.UsedBytes = used
+	st.QuotaGB = quota
+	saveTrafficState(d.dataDir, id, st)
+}
+
+// MarkTrafficReconnected 清除断网标记，保留累计用量。
+func (d *QEMU) MarkTrafficReconnected(id uint) {
+	mu := trafficLockFor(d.dataDir, id)
+	mu.Lock()
+	defer mu.Unlock()
+	st := loadTrafficState(d.dataDir, id)
+	st.Disconnected = false
+	st.OriginalNetwork = nil
+	saveTrafficState(d.dataDir, id, st)
+}
+
+// setInterfaceLink 把实例全部虚拟网卡的链路置为 up/down（不断电断网）。
+// down 用于流量超限，up 用于配额恢复后重连。任一网卡成功即视为成功。
+func (d *QEMU) setInterfaceLink(ctx context.Context, inst *protocol.Instance, up bool) error {
+	name := resourceName("qemu", inst)
+	out, err := output(ctx, "virsh", "domiflist", name)
+	if err != nil {
+		return err
+	}
+	ifaces := parseQEMUInterfaces(string(out))
+	if len(ifaces) == 0 {
+		return fmt.Errorf("未找到虚拟网卡")
+	}
+	state := "down"
+	if up {
+		state = "up"
+	}
+	var lastErr error
+	succeeded := 0
+	for _, iface := range ifaces {
+		if iface.Name == "" || iface.Name == "lo" {
+			continue
+		}
+		if err := run(ctx, "virsh", "domif-setlink", name, iface.Name, state, "--live", "--config"); err != nil {
+			// 部分 libvirt 不支持 --config，与 live 单独重试一次。
+			if err2 := run(ctx, "virsh", "domif-setlink", name, iface.Name, state); err2 != nil {
+				lastErr = err2
+				continue
+			}
+		}
+		succeeded++
+	}
+	if succeeded == 0 {
+		if lastErr != nil {
+			return lastErr
+		}
+		return fmt.Errorf("全部网卡链路切换失败")
+	}
+	return nil
+}
+
+// SetNetworkConnected 是流量执法的统一入口：connected=false 断网不断电，
+// connected=true 恢复链路。Incus 侧由 ConfigureNetwork(mode=none) 承担，
+// QEMU 侧走 domif-setlink，保持语义一致。
+func (d *QEMU) SetNetworkConnected(ctx context.Context, inst *protocol.Instance, connected bool) error {
+	return d.setInterfaceLink(ctx, inst, connected)
 }
 
 // ConfigureNetwork ensures the requested network infrastructure and restarts
 // the guest so the persisted domain definition is active.
 func (d *QEMU) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) error {
+	// 流量超限断网：mode=none 时直接链路 down，不重建 domain、不重启，
+	// 做到不断电断网；重连时再 link up。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNone {
+		if status, err := d.Status(ctx, inst); err == nil && status == StatusRunning {
+			_ = d.setInterfaceLink(ctx, inst, false)
+		}
+		return nil
+	}
 	if err := d.ensureNetwork(ctx, inst); err != nil {
 		return err
+	}
+	// 从断网恢复：先把链路拉回 up，再按常规重启使配置生效。
+	if status, err := d.Status(ctx, inst); err == nil && status == StatusRunning {
+		_ = d.setInterfaceLink(ctx, inst, true)
 	}
 	status, err := d.Status(ctx, inst)
 	if err != nil {

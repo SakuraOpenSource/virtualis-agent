@@ -17,6 +17,7 @@ import (
 type Incus struct {
 	mu      sync.Mutex
 	samples map[uint]incusSample
+	dataDir string
 }
 
 type incusSample struct {
@@ -25,8 +26,11 @@ type incusSample struct {
 	at      time.Time
 }
 
-func NewIncus() *Incus {
-	return &Incus{samples: make(map[uint]incusSample)}
+func NewIncus() *Incus { return NewIncusWithDataDir("") }
+
+// NewIncusWithDataDir 让累计流量文件落到被控数据目录；空目录表示仅内存计量。
+func NewIncusWithDataDir(dataDir string) *Incus {
+	return &Incus{samples: make(map[uint]incusSample), dataDir: dataDir}
 }
 func (d *Incus) Name() string { return "incus" }
 
@@ -143,6 +147,11 @@ func (d *Incus) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) e
 	}
 	if err := run(ctx, d.cli(), "profile", "assign", name, profile); err != nil && !contains(err.Error(), "already assigned") {
 		return fmt.Errorf("应用实例 profile 失败: %w", err)
+	}
+	// 流量超限断网（mode=none）：只把 eth0 换成 nictype=none 并挂载 profile，
+	// 绝不重启容器——不断电只断网，恢复时同样只换 profile（见重连路径）。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNone {
+		return nil
 	}
 	status, err := d.Status(ctx, inst)
 	if err != nil {
@@ -689,6 +698,7 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 	// 实例级 profile 用完即删：否则每次开通都会留下一个 virtualis-p-N
 	// 残留（profile 不随实例删除自动回收）。profile 不存在时忽略报错。
 	_ = run(ctx, d.cli(), "profile", "delete", fmt.Sprintf("virtualis-p-%d", inst.ID))
+	removeTrafficState(d.dataDir, inst.ID)
 	return nil
 }
 
@@ -725,10 +735,20 @@ func (d *Incus) HardRestart(ctx context.Context, inst *protocol.Instance) error 
 	return d.HardStart(ctx, inst)
 }
 func (d *Incus) Reinstall(ctx context.Context, inst *protocol.Instance) error {
+	// 重装换 guest 不清累计用量：Delete 会删容器与 profile，真删才清累计文件，
+	// 这里先快照、事后恢复（Create 成功与否都恢复，失败也不丢用量）。
+	snapshot := loadTrafficState(d.dataDir, inst.ID)
 	if err := d.Delete(ctx, inst); err != nil {
 		return err
 	}
-	return d.Create(ctx, inst)
+	createErr := d.Create(ctx, inst)
+	if snapshot != (trafficState{}) {
+		mu := trafficLockFor(d.dataDir, inst.ID)
+		mu.Lock()
+		saveTrafficState(d.dataDir, inst.ID, snapshot)
+		mu.Unlock()
+	}
+	return createErr
 }
 
 func (d *Incus) Status(ctx context.Context, inst *protocol.Instance) (string, error) {
@@ -833,7 +853,57 @@ func (d *Incus) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.
 	if metrics.CPUPercent > 100 {
 		metrics.CPUPercent = 100
 	}
+	// 累计流量配额：按差分累加 rx+tx 并落盘，计数器重置不丢失。
+	// BandwidthMbps 限速路径不受影响，这里只做计量与超限标记。
+	if used, exceeded := observeTraffic(d.dataDir, inst.ID, inst.Network.TrafficGB, rxBytes, txBytes); true {
+		metrics.TrafficUsedBytes = used
+		metrics.TrafficQuotaExceeded = exceeded
+	}
 	return metrics, nil
+}
+
+// CheckTrafficQuota 返回实例累计用量与超限状态，供后台断网轮询使用。
+// 不触发新的 hypervisor 查询，只读累计文件并用当前配额判定。
+func (d *Incus) CheckTrafficQuota(inst *protocol.Instance) (uint64, bool) {
+	st := loadTrafficState(d.dataDir, inst.ID)
+	quota := inst.Network.TrafficGB
+	if quota <= 0 {
+		quota = st.QuotaGB
+	}
+	return st.UsedBytes, TrafficQuotaExceeded(st.UsedBytes, quota)
+}
+
+// TrafficStateOf 暴露累计文件的断网标记与原始网络，供 agent 主循环做断网/重连。
+func (d *Incus) TrafficStateOf(id uint) (disconnected bool, original *protocol.NetworkConfig, used uint64, quota int) {
+	st := loadTrafficState(d.dataDir, id)
+	return st.Disconnected, st.OriginalNetwork, st.UsedBytes, st.QuotaGB
+}
+
+// MarkTrafficDisconnected 记录断网动作与断网前的原始网络（幂等：已标记则只更新用量配额）。
+func (d *Incus) MarkTrafficDisconnected(id uint, original protocol.NetworkConfig, used uint64, quota int) {
+	mu := trafficLockFor(d.dataDir, id)
+	mu.Lock()
+	defer mu.Unlock()
+	st := loadTrafficState(d.dataDir, id)
+	if st.OriginalNetwork == nil {
+		cp := original
+		st.OriginalNetwork = &cp
+	}
+	st.Disconnected = true
+	st.UsedBytes = used
+	st.QuotaGB = quota
+	saveTrafficState(d.dataDir, id, st)
+}
+
+// MarkTrafficReconnected 清除断网标记（重连成功后调用），保留累计用量。
+func (d *Incus) MarkTrafficReconnected(id uint) {
+	mu := trafficLockFor(d.dataDir, id)
+	mu.Lock()
+	defer mu.Unlock()
+	st := loadTrafficState(d.dataDir, id)
+	st.Disconnected = false
+	st.OriginalNetwork = nil
+	saveTrafficState(d.dataDir, id, st)
 }
 
 func (d *Incus) Network(ctx context.Context, inst *protocol.Instance) (protocol.NetworkStatus, error) {

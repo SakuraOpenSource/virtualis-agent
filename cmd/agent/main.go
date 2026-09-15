@@ -43,6 +43,9 @@ type agentServer struct {
 	// bootReady 记录创建/重装后的首次 root 密码注入是否已完成；重启 agent
 	// 后状态丢失，主控的下一次“配置网络”会重新校准，这里只求真实乐观。
 	bootReady map[uint]bool
+	// enforcing 是流量执法轮询的重叠 guard：上一轮清扫未完成时跳过本轮，
+	// 避免 hypervisor 查询慢时多轮叠加打爆被控。
+	enforcing atomic.Bool
 }
 
 // markBootReady / bootReadyOf 是 ssh 就绪标记的并发安全读写口。
@@ -657,7 +660,29 @@ func (s *agentServer) updateNATMappings(w http.ResponseWriter, r *http.Request, 
 	}
 	instance, err := s.storedInstance(id)
 	if err != nil {
+		// agent 重启后内存表为空：整包信任主控下发的身份。
 		instance = payload.Instance
+	} else if payload.Instance.ID == id {
+		// 主控下发的身份为准：覆盖内存里可能过期/损坏的身份（空 Name 会让
+		// Status 查错容器、误判停机而清空 NAT 规则），网络字段按需合并。
+		if payload.Instance.Name != "" {
+			instance.Name = payload.Instance.Name
+		}
+		if payload.Instance.Driver != "" {
+			instance.Driver = payload.Instance.Driver
+		}
+		if payload.Instance.Type != "" {
+			instance.Type = payload.Instance.Type
+		}
+		if payload.Instance.Network.Mode != "" {
+			instance.Network.Mode = payload.Instance.Network.Mode
+		}
+		if payload.Instance.Network.IPv4 != "" {
+			instance.Network.IPv4 = payload.Instance.Network.IPv4
+		}
+		if payload.Instance.Network.MAC != "" {
+			instance.Network.MAC = payload.Instance.Network.MAC
+		}
 	}
 	d, err := s.registry.Resolve(r.Context(), instance.Driver)
 	if err != nil {
@@ -1178,6 +1203,8 @@ func main() {
 
 	ctx, stop := signalContext()
 	defer stop()
+	// 累计流量执法：60s 采样一次，超限断网不断电，扩容后自动重连。
+	go state.startTrafficEnforcer(ctx)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
