@@ -117,9 +117,7 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	if inst.Type == "vm" {
 		args = append(args, "--vm")
 	}
-	if inst.Spec.CPU > 0 {
-		args = append(args, "-c", fmt.Sprintf("limits.cpu=%d", inst.Spec.CPU))
-	}
+	args = append(args, incusCPUArgs(inst)...)
 	if inst.Spec.MemoryMB > 0 {
 		args = append(args, "-c", fmt.Sprintf("limits.memory=%dMiB", inst.Spec.MemoryMB))
 	}
@@ -684,6 +682,36 @@ func profileDeviceExists(ctx context.Context, cli, profile, device string) (bool
 	return profileHasDevice(out, device)
 }
 
+// cpuCoresEffective 返回实例的等效整核数：设置了毫核时向上取整，否则用
+// CPU 字段。用于指标归一化与 VM 的 vCPU 数（VM 只能整核）。
+func cpuCoresEffective(spec protocol.InstanceSpec) int {
+	if spec.CPUMilli > 0 {
+		return (spec.CPUMilli + 999) / 1000
+	}
+	if spec.CPU > 0 {
+		return spec.CPU
+	}
+	return 1
+}
+
+// incusCPUArgs 把 CPU 配额翻译成 launch 的 -c 参数。
+//
+// 整核：limits.cpu=N（cpuset 绑核）。小数核：Incus 6 拒绝
+// limits.cpu=0.5（Invalid CPU limit syntax），cgroup v2 上
+// limits.cpu.allowance 的百分比形式也不生效，只有时间片形式生效
+// （HK 43.255.159.9 实测）—— 因此绑 ceil 核 + limits.cpu.allowance
+// =<毫核/10>ms/100ms（100ms 周期等于 1 核：0.4 核 = 40ms/100ms，
+// 2.5 核 = 绑 3 核 + 250ms/100ms 总配额）。VM 无法做 cgroup 配额，
+// 直接按等效整核数分配 vCPU。
+func incusCPUArgs(inst *protocol.Instance) []string {
+	cores := cpuCoresEffective(inst.Spec)
+	args := []string{"-c", fmt.Sprintf("limits.cpu=%d", cores)}
+	if inst.Type != "vm" && inst.Spec.CPUMilli > 0 && inst.Spec.CPUMilli%1000 != 0 {
+		args = append(args, "-c", fmt.Sprintf("limits.cpu.allowance=%dms/100ms", inst.Spec.CPUMilli/10))
+	}
+	return args
+}
+
 func (d *Incus) ensureImageAliasCleaned(ctx context.Context, alias string) {
 	// 镜像已随实例 launch 挂载，别名只是导入时的临时名字，删掉防堆积。
 	_ = run(context.WithoutCancel(ctx), d.cli(), "image", "delete", alias)
@@ -834,7 +862,7 @@ func (d *Incus) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.
 	if ok {
 		seconds := metrics.CollectedAt.Sub(previous.at).Seconds()
 		if seconds > 0 && state.CPU.Usage >= previous.cpuTime {
-			cores := inst.Spec.CPU
+			cores := cpuCoresEffective(inst.Spec)
 			if cores < 1 {
 				cores = 1
 			}
@@ -1016,9 +1044,11 @@ func (d *Incus) ensureContainerIPv4(ctx context.Context, name, expectIP string) 
 	_, gateway := natSlotIPOn("incusbr0", &protocol.Instance{ID: 1})
 	gw := gateway
 	ip := strings.Split(expectIP, "/")[0]
-	script := "ip addr add " + ip + "/24 dev eth0 2>/dev/null; ip link set eth0 up"
+	// Alpine 等精简镜像可能只有 busybox：iproute2 的 ip 不存在时回退
+	// ifconfig/route（busybox 自带），保证静态兜底仍可落盘。
+	script := "ip addr add " + ip + "/24 dev eth0 2>/dev/null || ifconfig eth0 " + ip + " netmask 255.255.255.0 2>/dev/null; ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null || true"
 	if gw != "" {
-		script += "; ip route replace default via " + gw + " dev eth0"
+		script += "; ip route replace default via " + gw + " dev eth0 2>/dev/null || route add default gw " + gw + " eth0 2>/dev/null || true"
 	}
 	// 静态路径没有 DHCP 下发的 DNS：不配置会导致 apt 解析域名失败
 	// （openssh 安装必然失败）。优先交给 systemd-resolved 管理，
@@ -1102,10 +1132,28 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 	if err := exec(ctx, "sh", "-c", "command -v sshd >/dev/null 2>&1 || test -x /usr/sbin/sshd"); err != nil {
 		return fmt.Errorf("安装后仍找不到 sshd: %w", err)
 	}
+	// 主机密钥可能缺失（精简镜像未带 ssh_host_*，或 apt 半途被中断）：
+	// sshd -t 会报 no hostkeys available，必须先生成；/run/sshd 是
+	// privilege separation 目录，容器重启后常被清掉，一并补齐。
+	ensure := "mkdir -p /run/sshd; test -f /etc/ssh/ssh_host_ed25519_key || " +
+		"ssh-keygen -A 2>/dev/null || true"
+	if err := exec(ctx, "sh", "-c", ensure); err != nil {
+		return fmt.Errorf("生成 SSH 主机密钥失败: %w", err)
+	}
+	if err := exec(ctx, "sh", "-c", "ls /etc/ssh/ssh_host_* >/dev/null 2>&1 || ssh-keygen -A"); err != nil {
+		return fmt.Errorf("SSH 主机密钥缺失: %w", err)
+	}
 	if err := exec(ctx, "sh", "-c", "echo root:"+shellQuote(password)+" | chpasswd"); err != nil {
 		return fmt.Errorf("设置 root 密码失败: %w", err)
 	}
-	config := "mkdir -p /etc/ssh/sshd_config.d && printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/00-virtualis.conf"
+	// 双写登录配置：Debian/Ubuntu 走 sshd_config.d drop-in；Alpine 等
+	// 精简镜像的 sshd_config 没有 Include，drop-in 会被忽略，因此同时
+	// sed 原地改写主配置（无该指令行时追加）。
+	config := "mkdir -p /etc/ssh/sshd_config.d && printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/00-virtualis.conf; " +
+		"sed -i -E 's/^#?[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null; " +
+		"grep -q '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config; " +
+		"sed -i -E 's/^#?[[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null; " +
+		"grep -q '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config"
 	if err := exec(ctx, "sh", "-c", config); err != nil {
 		return fmt.Errorf("写入 SSH 登录配置失败: %w", err)
 	}

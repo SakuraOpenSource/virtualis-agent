@@ -481,3 +481,29 @@ func TestIncusEth0DeviceArgsIncludesLimits(t *testing.T) {
 		t.Errorf("非托管桥不能带 ipv4.address: %s", unmanaged)
 	}
 }
+
+func TestIncusCPUArgs(t *testing.T) {
+	whole := incusCPUArgs(&protocol.Instance{Spec: protocol.InstanceSpec{CPU: 2}})
+	if len(whole) != 2 || whole[1] != "limits.cpu=2" {
+		t.Fatalf("whole cores: %#v", whole)
+	}
+	frac := incusCPUArgs(&protocol.Instance{Spec: protocol.InstanceSpec{CPU: 1, CPUMilli: 400}})
+	joined := strings.Join(frac, " ")
+	if !strings.Contains(joined, "limits.cpu=1") || !strings.Contains(joined, "limits.cpu.allowance=40ms/100ms") {
+		t.Fatalf("sub-core should pin 1 cpu + 40ms/100ms allowance: %#v", frac)
+	}
+	multi := incusCPUArgs(&protocol.Instance{Spec: protocol.InstanceSpec{CPUMilli: 2500}})
+	joined = strings.Join(multi, " ")
+	if !strings.Contains(joined, "limits.cpu=3") || !strings.Contains(joined, "limits.cpu.allowance=250ms/100ms") {
+		t.Fatalf("2.5 cores should pin 3 cpus + 250ms/100ms: %#v", multi)
+	}
+	vm := incusCPUArgs(&protocol.Instance{Type: "vm", Spec: protocol.InstanceSpec{CPUMilli: 400}})
+	joined = strings.Join(vm, " ")
+	if joined != "-c limits.cpu=1" || strings.Contains(joined, "allowance") {
+		t.Fatalf("vm should use ceil cores without allowance: %#v", vm)
+	}
+	wholeMilli := incusCPUArgs(&protocol.Instance{Spec: protocol.InstanceSpec{CPU: 2, CPUMilli: 2000}})
+	if strings.Join(wholeMilli, " ") != "-c limits.cpu=2" {
+		t.Fatalf("whole milli cores should not add allowance: %#v", wholeMilli)
+	}
+}

@@ -7,6 +7,10 @@ type InstanceSpec struct {
 	MemoryMB int    `json:"memory_mb"`
 	DiskGB   int    `json:"disk_gb"`
 	Arch     string `json:"arch,omitempty"`
+	// CPUMilli 是毫核表示的 CPU 配额（500 = 0.5 核）。非零时优先于 CPU：
+	// CPU 字段此时存向上取整的整核数，供旧版本与 VM 使用。0 表示未设置
+	// （纯整核场景），保持旧实例数据兼容。
+	CPUMilli int `json:"cpu_milli,omitempty"`
 }
 
 type NetworkConfig struct {

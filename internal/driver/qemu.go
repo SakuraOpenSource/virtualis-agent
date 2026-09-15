@@ -261,7 +261,7 @@ func (d *QEMU) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.M
 		seconds := metrics.CollectedAt.Sub(previous.at).Seconds()
 		if seconds > 0 {
 			if cpuTime >= previous.cpuTime {
-				cores := inst.Spec.CPU
+				cores := cpuCoresEffective(inst.Spec)
 				if cores < 1 {
 					cores = 1
 				}
@@ -804,7 +804,7 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
 	if memory < 128 {
 		memory = 1024
 	}
-	cpu := inst.Spec.CPU
+	cpu := cpuCoresEffective(inst.Spec)
 	if cpu < 1 {
 		cpu = 1
 	}
