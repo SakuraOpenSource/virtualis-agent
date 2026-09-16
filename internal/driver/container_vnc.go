@@ -188,6 +188,15 @@ func vncListening(port int) bool {
 	return true
 }
 
+// stopContainerVNCProcesses 按命令行特征回收实例的 VNC 三件套。
+// 注意模式不能以 "-" 开头：pkill 会把它当成自己的选项，导致 xterm/x11vnc
+// 从来杀不掉（实例停了进程还在，端口与 display 槽位持续泄漏）。
+func stopContainerVNCProcesses(display, port int) {
+	_ = run(context.Background(), "pkill", "-f", fmt.Sprintf("Xvfb :%d ", display))
+	_ = run(context.Background(), "pkill", "-f", fmt.Sprintf("x11vnc.*rfbport %d", port))
+	_ = run(context.Background(), "pkill", "-f", fmt.Sprintf("xterm.*-display :%d", display))
+}
+
 func waitVNCListening(port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -252,8 +261,3 @@ func (m *containerVNCManager) stop(driverName string, inst *protocol.Instance) {
 	log.Printf("容器 VNC 会话已回收: %s", key)
 }
 
-func stopContainerVNCProcesses(display, port int) {
-	_ = run(context.Background(), "pkill", "-f", fmt.Sprintf("Xvfb :%d ", display))
-	_ = run(context.Background(), "pkill", "-f", fmt.Sprintf("rfbport %d", port))
-	_ = run(context.Background(), "pkill", "-f", fmt.Sprintf("-display :%d", display))
-}
