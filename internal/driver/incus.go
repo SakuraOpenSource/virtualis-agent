@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -271,6 +272,7 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		return fmt.Errorf("配置网络设备失败: %w", err)
 	}
 	d.ensureLxcfsDevices(ctx, profile)
+	d.ensureCPUViewDevices(ctx, profile, inst)
 	return nil
 }
 
@@ -300,6 +302,53 @@ func (d *Incus) ensureLxcfsDevices(ctx context.Context, profile string) {
 				"source=/var/lib/lxcfs/proc/"+file, "path=/proc/"+file)
 		} else if exists {
 			_ = run(ctx, d.cli(), "profile", "device", "remove", profile, device)
+		}
+	}
+}
+
+// ensureCPUViewDevices 把 sysfs 的 CPU 拓扑文件以单文件 disk 设备挂进实例
+// profile，内容按实例核数生成（1 核 → "0"，N 核 → "0-(N-1)"）。
+//
+// lscpu 不读 lxcfs 虚拟化的 /proc/cpuinfo，而是优先读
+// /sys/devices/system/cpu/{online,present,possible}；这三个文件在容器里
+// 直通宿主机，所以 0.25 核（绑 1 核）的容器里 lscpu 依旧显示宿主机全部
+// 核心（nproc/cgroup 是对的，只有 lscpu 撒谎）。按实例核数覆盖这三个
+// 文件后，lscpu 才与 nproc/cgroup 视图一致。
+//
+// 宿主机文件缺失会让实例无法启动，因此写入失败时跳过挂载（保持 best
+// effort，与 ensureLxcfsDevices 同一容错思路）；每次都重写文件内容，
+// 实例升配后核数视图跟着走。
+func (d *Incus) ensureCPUViewDevices(ctx context.Context, profile string, inst *protocol.Instance) {
+	cores := cpuCoresEffective(inst.Spec)
+	if cores <= 0 {
+		return
+	}
+	cpulist := "0"
+	if cores > 1 {
+		cpulist = fmt.Sprintf("0-%d", cores-1)
+	}
+	dir := filepath.Join(d.dataDir, "cpu-view", strconv.FormatUint(uint64(inst.ID), 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("实例 %d CPU 视图目录创建失败，跳过 sysfs 覆盖: %v", inst.ID, err)
+		return
+	}
+	for _, file := range []string{"online", "present", "possible"} {
+		target := filepath.Join(dir, file)
+		if err := os.WriteFile(target, []byte(cpulist+"\n"), 0o644); err != nil {
+			log.Printf("实例 %d 写 %s 失败，跳过 sysfs 覆盖: %v", inst.ID, target, err)
+			return
+		}
+		device := "sysfs-cpu-" + file
+		exists, err := profileDeviceExists(ctx, d.cli(), profile, device)
+		if err != nil {
+			continue
+		}
+		if exists {
+			continue
+		}
+		if err := run(ctx, d.cli(), "profile", "device", "add", profile, device, "disk",
+			"source="+target, "path=/sys/devices/system/cpu/"+file, "readonly=true"); err != nil {
+			log.Printf("实例 %d 挂载 sysfs cpu/%s 失败（不影响使用，仅 lscpu 视图不精确）: %v", inst.ID, file, err)
 		}
 	}
 }
@@ -795,6 +844,8 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 	// 实例级 profile 用完即删：否则每次开通都会留下一个 virtualis-p-N
 	// 残留（profile 不随实例删除自动回收）。profile 不存在时忽略报错。
 	_ = run(ctx, d.cli(), "profile", "delete", fmt.Sprintf("virtualis-p-%d", inst.ID))
+	// CPU 视图文件随实例清理。
+	_ = os.RemoveAll(filepath.Join(d.dataDir, "cpu-view", strconv.FormatUint(uint64(inst.ID), 10)))
 	// 独立磁盘池随实例清理：池大小=配额，实例没了池就没意义。
 	// 老实例（root 在共享池上）删除 vdisk-N 会报 not found，忽略即可。
 	_ = run(ctx, d.cli(), "storage", "delete", dedicatedPoolName(inst.ID))
@@ -803,6 +854,9 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 }
 
 func (d *Incus) Start(ctx context.Context, inst *protocol.Instance) error {
+	// 存量实例下次开机也能拿到正确的 sysfs CPU 视图（profile 设备在 start
+	// 展开时生效）；文件与设备都已就位时是纯 no-op。
+	d.ensureCPUViewDevices(ctx, fmt.Sprintf("virtualis-p-%d", inst.ID), inst)
 	err := run(ctx, d.cli(), "start", resourceName("incus", inst))
 	// launch 创建的实例一落地就在运行，"already running" 视为成功。
 	if err != nil && !contains(err.Error(), "already running") {
@@ -1255,7 +1309,12 @@ func shellQuote(value string) string {
 func (d *Incus) VNC(ctx context.Context, inst *protocol.Instance, _ string) (protocol.VNCInfo, error) {
 	port, err := containerVNC.ensure(ctx, d.Name(), inst,
 		func() bool { s, _ := d.Status(ctx, inst); return s == StatusRunning },
-		func(name string) []string { return []string{d.cli(), "exec", name, "--", "/bin/bash", "-l"} })
+		// 不写死 bash：Alpine 等镜像没有 /bin/bash，xterm 起来就退，
+		// VNC 只剩黑屏。用 sh 探测后再进登录 shell。
+		func(name string) []string {
+			return []string{d.cli(), "exec", name, "--", "/bin/sh", "-c",
+				"command -v bash >/dev/null 2>&1 && exec bash -l || exec sh -l"}
+		})
 	if err != nil {
 		return protocol.VNCInfo{Available: false, Message: err.Error()}, nil
 	}
