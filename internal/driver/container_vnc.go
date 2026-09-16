@@ -260,4 +260,3 @@ func (m *containerVNCManager) stop(driverName string, inst *protocol.Instance) {
 	m.release(key)
 	log.Printf("容器 VNC 会话已回收: %s", key)
 }
-
