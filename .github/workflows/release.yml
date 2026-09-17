@@ -59,11 +59,13 @@ jobs:
 
           # The tag lands in artifact names and the release itself, so guard
           # against typos early.
+          # case takes the first matching pattern and "*" eats suffixes like
+          # "-rc.1", so the suffixed (pre-release) pattern must come first.
           case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*)
-              prerelease=false ;;
             v[0-9]*.[0-9]*.[0-9]*-*)
               prerelease=true ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              prerelease=false ;;
             *)
               echo "Tag must look like v1.2.3 (stable) or v1.2.3-rc.1 (pre-release), got: $tag"
               exit 1 ;;
