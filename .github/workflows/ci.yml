@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The shipped artifact is a CGO_ENABLED=0 single binary, so run the
+      # suite in release configuration first.
+      - name: go test
+        run: CGO_ENABLED=0 go test ./...
+
+      # The race detector requires cgo, so CGO_ENABLED must stay enabled
+      # here (it errors out when disabled).
+      - name: go test -race
+        run: CGO_ENABLED=1 go test -race ./...
+
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files, run gofmt -w .:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: CGO_ENABLED=0 go vet ./...

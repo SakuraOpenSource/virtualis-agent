@@ -1,5 +1,17 @@
 name: Release
 
+# Two ways to trigger:
+#   - Manual: fill in the release tag on the Actions page; the tag is
+#     created on the current commit when it does not exist yet.
+#   - Tag push: `git tag v1.0.0 && git push --tags`.
+#
+# Tag shape decides the release kind:
+#   - v1.2.3            -> stable release
+#   - v1.2.3-rc.1       -> pre-release (GitHub "Pre-release" flag set)
+#
+# Release notes scope:
+#   - pre-release: every commit since the last release of ANY kind
+#   - stable:      every commit since the last STABLE release
 on:
   push:
     tags:
@@ -7,27 +19,86 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v1.0.0)"
+        description: "Tag to release, e.g. v1.0.0 (created on the current commit if missing)"
         required: false
         type: string
+      prerelease:
+        description: "Force a pre-release (tags with a suffix are always pre-releases)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
+    name: Build and publish artifacts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
-      - name: Setup Go
+      # Trigger sources differ, so normalize first; later steps only read
+      # these outputs. Inputs travel through env instead of being spliced
+      # into the script, so quotes in an input cannot break the command.
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+
+          # The tag lands in artifact names and the release itself, so guard
+          # against typos early.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*)
+              prerelease=false ;;
+            v[0-9]*.[0-9]*.[0-9]*-*)
+              prerelease=true ;;
+            *)
+              echo "Tag must look like v1.2.3 (stable) or v1.2.3-rc.1 (pre-release), got: $tag"
+              exit 1 ;;
+          esac
+          # The manual checkbox can force a stable tag out as a pre-release.
+          if [ "$INPUT_PRERELEASE" = "true" ]; then
+            prerelease=true
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (prerelease: $prerelease)"
+
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
           cache: true
+
+      # Categorize commits by Conventional Commits prefix via the shared
+      # script. Runs before the build: broken history should fail fast,
+      # not after ten minutes of compiling.
+      - name: Generate release notes
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+            bash scripts/release_notes.sh "$TAG" any > release-notes.md
+          else
+            bash scripts/release_notes.sh "$TAG" stable > release-notes.md
+          fi
+          cat release-notes.md
 
       - name: Build all platforms
         run: |
@@ -45,18 +116,22 @@ jobs:
           done
           ls -lh bin/
 
-      - name: Checksums
+      - name: Generate checksums
         run: |
           cd bin
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Release
+      # When the tag does not exist yet, this step creates it on
+      # target_commitish, so manual runs do not need a pre-pushed tag.
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: ${{ inputs.tag || github.ref_name }}
-          generate_release_notes: true
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          body_path: release-notes.md
           files: |
             bin/*
             bin/SHA256SUMS
