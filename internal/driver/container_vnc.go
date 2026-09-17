@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
@@ -94,7 +93,7 @@ func (m *containerVNCManager) ensure(ctx context.Context, driverName string, ins
 	displayStr := strconv.Itoa(display)
 
 	xvfb := exec.Command("Xvfb", ":"+displayStr, "-screen", "0", "1280x800x24", "-nolisten", "tcp")
-	xvfb.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	xvfb.SysProcAttr = setpgidAttr()
 	if err := xvfb.Start(); err != nil {
 		return 0, fmt.Errorf("启动 Xvfb 失败: %w", err)
 	}
@@ -159,7 +158,7 @@ func startXterm(display, name string, argv []string, env []string) error {
 	xterm.Args = append(xterm.Args, "-e")
 	xterm.Args = append(xterm.Args, argv...)
 	xterm.Env = env
-	xterm.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	xterm.SysProcAttr = setpgidAttr()
 	if err := xterm.Start(); err != nil {
 		return fmt.Errorf("启动 xterm 失败: %w", err)
 	}
@@ -171,7 +170,7 @@ func startX11VNC(display string, port int, env []string) error {
 		"-rfbport", strconv.Itoa(port), "-nopw", "-shared", "-forever", "-quiet",
 		"-noxrecord", "-noxdamage")
 	x11vnc.Env = env
-	x11vnc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	x11vnc.SysProcAttr = setpgidAttr()
 	if err := x11vnc.Start(); err != nil {
 		return fmt.Errorf("启动 x11vnc 失败: %w", err)
 	}
