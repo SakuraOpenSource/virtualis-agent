@@ -2,9 +2,16 @@
 # Generate categorized English release notes for a release tag.
 #
 # Usage: release_notes.sh <tag> <mode>
-#   mode "stable" - the diff base is the nearest ancestor STABLE tag
-#                   (vX.Y.Z); commits already shipped in pre-releases are
-#                   listed again in the stable release.
+#   mode "stable" - the diff base is the most recent PUBLISHED stable
+#                   release, i.e. the newest GitHub release whose
+#                   prerelease flag is false (drafts don't count). The
+#                   flag - not the tag name - is the source of truth:
+#                   v0.1.0/v0.2.0 shipped with the pre-release checkbox
+#                   ticked and must not act as stable bases. When no
+#                   published stable release exists at all, the notes
+#                   cover the full history from the very first commit.
+#                   Commits already shipped in pre-releases are listed
+#                   again in the stable release.
 #   mode "any"    - the diff base is the nearest ancestor tag of any kind
 #                   (used for pre-releases such as v1.2.3-rc.1).
 #
@@ -31,40 +38,40 @@ if git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null 2>&1; then
 else
   TAG_SHA="$(git rev-parse HEAD)"
 fi
-
-# Stable tags are plain vX.Y.Z; anything with a semver suffix (v1.2.3-rc.1)
-# counts as a pre-release.
-is_stable_tag() {
-  case "$1" in
-    v[0-9]*.[0-9]*.[0-9]*) ;;
-    *) return 1 ;;
-  esac
-  # The glob above is loose ("*" matches "-rc.1" too), so reject anything
-  # carrying a semver pre-release suffix explicitly.
-  [ "${1#*-}" = "$1" ]
-}
 # Previous tag: nearest ancestor of the release commit, excluding the
-# release tag itself. Stable mode skips pre-release tags so that a stable
-# release covers everything since the last stable one.
+# release tag itself. Stable mode asks GitHub for the newest release
+# whose prerelease flag is false (publish flag > tag name: v0.2.0 was
+# published with the pre-release checkbox ticked, so by name it looks
+# stable but in fact isn't a stable baseline). Only releases whose tag
+# is an ancestor of the release commit qualify; when none exist the
+# notes are generated over the full history.
 PREV=''
-best_dist=''
-# Nearest ancestor tag by topology (commit distance), not by tag date:
-# same-second tags make date sorts unreliable, and version sorts rank
-# pre-releases (v1.0.0-rc.1) behind their own stable tag (v1.0.0).
-# Stable mode only considers stable tags so a stable release covers
-# everything since the last stable one.
-while IFS= read -r candidate; do
-  [ "$candidate" = "$TAG" ] && continue
-  if [ "$MODE" = stable ] && ! is_stable_tag "$candidate"; then
-    continue
-  fi
-  git merge-base --is-ancestor "$candidate" "$TAG_SHA" 2>/dev/null || continue
-  dist="$(git rev-list --count "$candidate..$TAG_SHA")"
-  if [ -z "$best_dist" ] || [ "$dist" -lt "$best_dist" ]; then
-    best_dist="$dist"
-    PREV="$candidate"
-  fi
-done < <(git tag)
+if [ "$MODE" = stable ]; then
+  # gh may be absent (local runs) or the API may fail; in that case fall
+  # back to the name-based rule below rather than dying with set -e.
+  PREV="$(gh api "repos/${REPO}/releases" --paginate \
+    --jq '[.[] | select(.draft == false and .prerelease == false)] | sort_by(.created_at) | reverse | .[].tag_name' 2>/dev/null \
+    | while IFS= read -r candidate; do
+        [ "$candidate" = "$TAG" ] && continue
+        git merge-base --is-ancestor "$candidate" "$TAG_SHA" 2>/dev/null || continue
+        printf '%s\n' "$candidate"
+        break
+      done)"
+else
+  # Nearest ancestor tag by topology (commit distance), not by tag date:
+  # same-second tags make date sorts unreliable, and version sorts rank
+  # pre-releases (v1.0.0-rc.1) behind their own stable tag (v1.0.0).
+  best_dist=''
+  while IFS= read -r candidate; do
+    [ "$candidate" = "$TAG" ] && continue
+    git merge-base --is-ancestor "$candidate" "$TAG_SHA" 2>/dev/null || continue
+    dist="$(git rev-list --count "$candidate..$TAG_SHA")"
+    if [ -z "$best_dist" ] || [ "$dist" -lt "$best_dist" ]; then
+      best_dist="$dist"
+      PREV="$candidate"
+    fi
+  done < <(git tag)
+fi
 
 RANGE_ARGS=("$TAG_SHA")
 if [ -n "$PREV" ]; then

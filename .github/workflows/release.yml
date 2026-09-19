@@ -94,6 +94,8 @@ jobs:
         env:
           TAG: ${{ steps.meta.outputs.tag }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # gh api needs a token to read the release list (prerelease flags).
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
             bash scripts/release_notes.sh "$TAG" any > release-notes.md
