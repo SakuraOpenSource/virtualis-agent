@@ -138,3 +138,62 @@ func TestObserveTrafficCorruptFileSkips(t *testing.T) {
 		t.Fatalf("损坏文件必须原样保留: %q err=%v", raw, err)
 	}
 }
+
+// TestReinstallSnapshotRestore 锁定重装流量快照语义（回归 6ed06a7）：
+// Reinstall = 快照 → Delete（清累计文件）→ Create → 恢复快照。
+// 这里直接驱动这条序列的流量状态部分，验证 Delete 后文件被清、
+// 恢复后累计值/断网标记/原始网络一个不丢。
+func TestReinstallSnapshotRestore(t *testing.T) {
+	dir := t.TempDir()
+	const id = 4242
+	original := trafficState{
+		UsedBytes:       11 << 30, // 11 GiB
+		LastRx:          6 << 30,
+		LastTx:          5 << 30,
+		QuotaGB:         100,
+		Disconnected:    true,
+		OriginalNetwork: &protocol.NetworkConfig{Mode: "nat", BandwidthMbps: 200},
+	}
+	saveTrafficState(dir, id, original)
+
+	// Reinstall 第一步：快照（loadTrafficState）。
+	snapshot := loadTrafficState(dir, id)
+	if snapshot.UsedBytes != original.UsedBytes || snapshot.LastRx != original.LastRx ||
+		snapshot.LastTx != original.LastTx || snapshot.QuotaGB != original.QuotaGB ||
+		snapshot.Disconnected != original.Disconnected || snapshot.OriginalNetwork == nil {
+		t.Fatalf("快照应与落盘一致: %+v", snapshot)
+	}
+
+	// Delete 语义：真删才清累计文件。
+	removeTrafficState(dir, id)
+	if _, err := os.Stat(trafficStatePath(dir, id)); !os.IsNotExist(err) {
+		t.Fatal("Delete 后累计文件应不存在")
+	}
+
+	// Create 成功与否都恢复快照。
+	saveTrafficState(dir, id, snapshot)
+	restored := loadTrafficState(dir, id)
+	if restored.UsedBytes != original.UsedBytes || restored.LastRx != original.LastRx ||
+		restored.LastTx != original.LastTx || restored.QuotaGB != original.QuotaGB ||
+		restored.Disconnected != original.Disconnected || restored.OriginalNetwork == nil {
+		t.Fatalf("恢复后累计状态应完整: %+v", restored)
+	}
+	if restored.OriginalNetwork == nil || restored.OriginalNetwork.Mode != "nat" {
+		t.Fatal("恢复后原始网络配置应保留（超限断网后的重连依据）")
+	}
+}
+
+// TestReinstallSnapshotEmptyStateNoFile 零值快照不写文件：
+// 全新实例重装不应凭空造出 traffic_<id>.json（Reinstall 的 snapshot != (trafficState{}) 分支）。
+func TestReinstallSnapshotEmptyStateNoFile(t *testing.T) {
+	dir := t.TempDir()
+	const id = 777
+	snapshot := loadTrafficState(dir, id) // 无文件 → 零值
+	if snapshot != (trafficState{}) {
+		t.Fatal("无累计文件时应得到零值快照")
+	}
+	// 模拟 Create 之后走 snapshot != zero 分支未触发：文件不应存在。
+	if _, err := os.Stat(trafficStatePath(dir, id)); !os.IsNotExist(err) {
+		t.Fatal("零值快照不应落盘")
+	}
+}
