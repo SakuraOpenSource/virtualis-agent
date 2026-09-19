@@ -1080,7 +1080,14 @@ func (s *agentServer) register(ctx context.Context, master, endpoint string) err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Token", s.token)
-	client := &http.Client{Timeout: 15 * time.Second}
+	// 不跟随重定向：X-Agent-Token 是自定义头，跨主机重定向不会被剥掉，
+	// 跟随会把接入凭证发给重定向目标指定的任意地址。3xx 走下方非 2xx 分支。
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
