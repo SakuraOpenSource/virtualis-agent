@@ -168,10 +168,10 @@ func (d *QEMU) Start(ctx context.Context, inst *protocol.Instance) error {
 	if err == nil {
 		return nil
 	}
-	// 自愈：宿主机重启后 libvirt default 网络可能仍未自启，libvirt 会在
-	// 域启动时报 "network ... is not active"。这里强制拉起网络后重试一次。
+	// 自愈：宿主机重启后 libvirt 网络可能仍未自启，libvirt 会在域启动时
+	// 报 "network ... is not active"。这里强制拉起网络后重试一次。
 	if contains(err.Error(), "network") && contains(err.Error(), "not active") {
-		if fixErr := d.ensureDefaultNetwork(ctx); fixErr == nil {
+		if fixErr := d.ensureNetwork(ctx, inst); fixErr == nil {
 			if retryErr := d.action(ctx, "start", inst, "already active"); retryErr == nil {
 				return nil
 			}
@@ -740,6 +740,18 @@ func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error
 		return nil
 	case NetworkModeNat:
 		return d.ensureDefaultNetwork(ctx)
+	case NetworkModeVPC:
+		name := strings.TrimSpace(inst.Network.Bridge)
+		if name == "" {
+			return fmt.Errorf("VPC 网络名称缺失")
+		}
+		if _, err := output(ctx, "virsh", "net-info", name); err != nil {
+			return fmt.Errorf("VPC 网络 %s 未定义，请先在主控创建", name)
+		}
+		if err := run(ctx, "virsh", "net-start", name); err != nil && !contains(err.Error(), "already active") {
+			return fmt.Errorf("启动 VPC 网络 %s 失败: %w", name, err)
+		}
+		return nil
 	case NetworkModeDedicated:
 		if _, _, err := dedicatedTarget(inst.Network); err != nil {
 			return err
@@ -876,26 +888,31 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
 // qemuInterfaceXML 按网络模式生成 <interface>。
 //
 // NAT：挂 libvirt default NAT 网络，DHCP 自动发地址。
+// VPC：挂 libvirt 命名网络（Bridge 存网络名），DHCP 从 VPC 子网发地址。
 // 独立 IP：挂主机网桥（bridge 型）或物理网卡（macvtap direct/bridge），
 // 实例以自己的 MAC 直接出现在局域网，拿到独立 IP。
 // 关闭：不生成网卡。
 func qemuInterfaceXML(network protocol.NetworkConfig) string {
+	mac := macXML(network.MAC)
+	bandwidth := bandwidthXML(network.BandwidthMbps)
 	switch NormalizeNetworkMode(network.Mode) {
 	case NetworkModeNone:
 		return ""
+	case NetworkModeVPC:
+		name := strings.TrimSpace(network.Bridge)
+		if name == "" {
+			// 防御性降级为 NAT：正常路径 ensureNetwork 已拦截缺失名称。
+			return fmt.Sprintf("    <interface type='network'>%s<source network='default'/>%s<model type='virtio'/></interface>\n", mac, bandwidth)
+		}
+		return fmt.Sprintf("    <interface type='network'>%s<source network='%s'/>%s<model type='virtio'/></interface>\n", mac, html.EscapeString(name), bandwidth)
 	case NetworkModeNat:
-		mac := macXML(network.MAC)
-		bandwidth := bandwidthXML(network.BandwidthMbps)
 		return fmt.Sprintf("    <interface type='network'>%s<source network='default'/>%s<model type='virtio'/></interface>\n", mac, bandwidth)
 	}
 	target, isBridge, err := dedicatedTarget(network)
 	if err != nil {
 		// Create 前的 ensureNetwork 已校验过；这里防御性降级为 NAT。
-		mac := macXML(network.MAC)
 		return fmt.Sprintf("    <interface type='network'><source network='default'/>%s<model type='virtio'/></interface>\n", mac)
 	}
-	mac := macXML(network.MAC)
-	bandwidth := bandwidthXML(network.BandwidthMbps)
 	if isBridge {
 		return fmt.Sprintf("    <interface type='bridge'>%s<source bridge='%s'/>%s<model type='virtio'/></interface>\n", mac, html.EscapeString(target), bandwidth)
 	}

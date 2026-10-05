@@ -252,7 +252,8 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	}
 	parent := "incusbr0"
 	managed := true
-	if mode == NetworkModeDedicated {
+	switch mode {
+	case NetworkModeDedicated:
 		target, _, err := dedicatedTarget(network)
 		if err == nil && target != "" {
 			parent = target
@@ -261,6 +262,16 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		}
 		// 独立网卡的目标可能是宿主机物理口等非托管桥：只有托管网络才走 network=。
 		managed = d.isManagedNetwork(ctx, parent)
+	case NetworkModeVPC:
+		// VPC 网络是主控创建的托管网络，必须用 network= 挂载；不存在时
+		// 直接报错，而不是静默挂到默认桥产生越界的实例。
+		if v := strings.TrimSpace(network.Bridge); v != "" {
+			parent = v
+		}
+		managed = d.isManagedNetwork(ctx, parent)
+		if !managed {
+			return fmt.Errorf("VPC 网络 %s 不存在或不是托管网络，请先在主控创建", parent)
+		}
 	}
 	var spec []string
 	if managed {

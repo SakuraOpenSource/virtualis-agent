@@ -41,6 +41,10 @@ type Driver interface {
 	// chpasswd 立即生效；QEMU 依赖 guest agent，客户机启动完成前会失败，
 	// 实现内部做有限重试。注入失败返回错误，由调用方决定是否重试。
 	SetRootPassword(context.Context, *protocol.Instance, string) error
+	// CreateNetwork 创建 VPC 虚拟网络（托管网络 / libvirt 命名网络），
+	// DeleteNetwork 删除同名网络。
+	CreateNetwork(context.Context, protocol.NetworkSpec) error
+	DeleteNetwork(context.Context, string) error
 }
 
 // NATIdentityReconciler 由支持 NAT 的驱动可选实现：按域里网卡的"真实 MAC"

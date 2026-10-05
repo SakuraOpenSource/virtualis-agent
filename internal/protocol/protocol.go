@@ -48,6 +48,35 @@ type NATMapping struct {
 	GuestPort int    `json:"guest_port"`
 }
 
+// FirewallRule 是实例的一条防火墙规则。方向 in 匹配入向流量（-d 实例
+// IP、-s 来源 CIDR），方向 out 匹配出向流量（-s 实例 IP、-d 目标 CIDR）；
+// 端口一律按目标端口（--dport）匹配。priority 小的先匹配。
+type FirewallRule struct {
+	ID        uint   `json:"id,omitempty"`
+	Direction string `json:"direction"` // in / out
+	Action    string `json:"action"`    // accept / drop
+	Protocol  string `json:"protocol"`  // tcp / udp / icmp / any
+	PortStart int    `json:"port_start,omitempty"`
+	PortEnd   int    `json:"port_end,omitempty"`
+	CIDR      string `json:"cidr,omitempty"`
+	Priority  int    `json:"priority,omitempty"`
+	Enabled   bool   `json:"enabled"`
+	Remark    string `json:"remark,omitempty"`
+}
+
+// NetworkSpec 是 VPC 网络的创建参数：主控下发给被控，由对应驱动落地为
+// 托管网络（Incus）或 libvirt 命名网络（QEMU）。
+type NetworkSpec struct {
+	Name      string   `json:"name"`
+	Driver    string   `json:"driver,omitempty"` // incus / qemu；空 = 自动选择
+	Subnet    string   `json:"subnet"`           // CIDR，如 10.100.0.0/24
+	Gateway   string   `json:"gateway"`
+	DHCPStart string   `json:"dhcp_start,omitempty"`
+	DHCPEnd   string   `json:"dhcp_end,omitempty"`
+	NAT       bool     `json:"nat"`
+	DNS       []string `json:"dns,omitempty"`
+}
+
 type Instance struct {
 	ID          uint          `json:"id"`
 	Name        string        `json:"name"`
@@ -62,6 +91,8 @@ type Instance struct {
 	// NATMappings 是主控落库的期望清单，被控开机时据此配置 DNAT，
 	// 关机/删除时清除。整表下发，由被控幂等对账。
 	NATMappings []NATMapping `json:"nat_mappings,omitempty"`
+	// Firewall 是该实例的防火墙规则清单（整表下发，幂等对账）。
+	Firewall []FirewallRule `json:"firewall,omitempty"`
 	// RootPassword 只在创建请求里出现：agent 把它写进系统盘（QEMU）或
 	// 直接 chpasswd（容器），之后不再传输，也不出现在状态回包中。
 	RootPassword string `json:"root_password,omitempty"`

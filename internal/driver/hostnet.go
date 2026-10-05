@@ -19,6 +19,10 @@ const NetworkModeDedicated = "dedicated"
 // NetworkModeNone 关闭实例网络。
 const NetworkModeNone = "none"
 
+// NetworkModeVPC 是 VPC 模式：实例挂载到主控管理的虚拟私有网络，
+// 地址由该网络的 DHCP 分配。
+const NetworkModeVPC = "vpc"
+
 // NormalizeNetworkMode 归一化网络模式；历史数据里的 bridge 视为 dedicated。
 func NormalizeNetworkMode(mode string) string {
 	mode = strings.ToLower(strings.TrimSpace(mode))
@@ -29,6 +33,8 @@ func NormalizeNetworkMode(mode string) string {
 		return NetworkModeDedicated
 	case NetworkModeNone:
 		return NetworkModeNone
+	case NetworkModeVPC:
+		return NetworkModeVPC
 	}
 	return NetworkModeNat
 }

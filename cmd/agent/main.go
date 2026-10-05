@@ -86,9 +86,48 @@ func (s *agentServer) handler() http.Handler {
 	mux.Handle("/api/health", s.auth(http.HandlerFunc(s.health)))
 	mux.Handle("/api/drivers", s.auth(http.HandlerFunc(s.drivers)))
 	mux.Handle("/api/host/network", s.auth(http.HandlerFunc(s.hostNetwork)))
+	mux.Handle("/api/vpc", s.auth(http.HandlerFunc(s.vpcRoute)))
+	mux.Handle("/api/vpc/", s.auth(http.HandlerFunc(s.vpcRoute)))
 	mux.Handle("/api/instances", s.auth(http.HandlerFunc(s.createInstance)))
 	mux.Handle("/api/instances/", s.auth(http.HandlerFunc(s.instanceRoute)))
 	return mux
+}
+
+// vpcRoute 处理 VPC 网络的创建（POST /api/vpc）与删除
+// （DELETE /api/vpc/<name>?driver=）。网络由主控托管，被控只做落地。
+func (s *agentServer) vpcRoute(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/api/vpc":
+		var spec protocol.NetworkSpec
+		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid payload")
+			return
+		}
+		d, err := s.registry.Resolve(r.Context(), spec.Driver)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := d.CreateNetwork(r.Context(), spec); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"name": spec.Name, "driver": d.Name()})
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/vpc/"):
+		name := strings.TrimPrefix(r.URL.Path, "/api/vpc/")
+		d, err := s.registry.Resolve(r.Context(), r.URL.Query().Get("driver"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := d.DeleteNetwork(r.Context(), name); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
 }
 
 func (s *agentServer) auth(next http.Handler) http.Handler {
@@ -213,6 +252,7 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 			boot.RootPassword = ""
 			if boot.Status == driver.StatusRunning {
 				applyOrClearNAT(bootCtx, d, &boot, s, false)
+				applyFirewallIfRunning(bootCtx, &boot)
 			}
 		}()
 	}
@@ -252,6 +292,8 @@ func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
 		s.vncInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "nat":
 		s.updateNATMappings(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "firewall":
+		s.updateFirewallRules(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "password":
 		s.setPassword(w, r, id)
 	case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "vnc" && parts[2] == "ws":
@@ -280,6 +322,7 @@ func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 	driver.ClearNATRules(r.Context(), id)
+	driver.ClearFirewall(r.Context(), id)
 	if instance.Image != nil && instance.Image.Path != "" {
 		_ = os.Remove(instance.Image.Path)
 	}
@@ -362,6 +405,7 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 		instance.RootPassword = ""
 	}
 	applyOrClearNAT(r.Context(), d, &instance, s, false)
+	applyFirewallIfRunning(r.Context(), &instance)
 	s.mu.Lock()
 	s.instances[id] = instance
 	s.mu.Unlock()
@@ -389,9 +433,10 @@ func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id 
 	}
 	instance.Driver = d.Name()
 	instance.Status = status
-	// 自愈：域可能在被控升级/重启前就处于运行状态（那时没有 NAT 规则
-	// 逻辑），状态查询是最频繁的请求，借它幂等对账规则，无需重启实例。
+	// 自愈：域可能在被控升级/重启前就处于运行状态（那时没有 NAT/防火墙
+	// 规则逻辑），状态查询是最频繁的请求，借它幂等对账规则，无需重启实例。
 	applyOrClearNAT(r.Context(), d, &instance, s, true)
+	applyFirewallIfRunning(r.Context(), &instance)
 	instance.SSHReady = s.bootReadyOf(id)
 	s.mu.Lock()
 	s.instances[id] = instance
@@ -645,6 +690,71 @@ func applyOrClearNAT(ctx context.Context, d driver.Driver, instance *protocol.In
 	default:
 		driver.ClearNATRules(ctx, instance.ID)
 	}
+}
+
+// applyFirewallIfRunning 与 NAT 同一节奏：实例运行中就幂等重建防火墙链；
+// 停止状态不做处理（链挂在 FORWARD 上不产生流量，规则留待下次开机应用）。
+func applyFirewallIfRunning(ctx context.Context, instance *protocol.Instance) {
+	if instance.Status != driver.StatusRunning {
+		return
+	}
+	if err := driver.ApplyFirewall(ctx, instance); err != nil {
+		log.Printf("实例 %d 应用防火墙规则失败: %v", instance.ID, err)
+	}
+}
+
+// updateFirewallRules 让被控按主控下发的全量清单对账实例防火墙。
+func (s *agentServer) updateFirewallRules(w http.ResponseWriter, r *http.Request, id uint) {
+	var payload struct {
+		Instance protocol.Instance       `json:"instance"`
+		Rules    []protocol.FirewallRule `json:"rules"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Instance.ID != id {
+		writeError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	instance, err := s.storedInstance(id)
+	if err != nil {
+		// agent 重启后内存表为空：整包信任主控下发的身份。
+		instance = payload.Instance
+	} else {
+		// 与 NAT 相同的合并口径：主控身份为准，网络字段按需合并。
+		if payload.Instance.Name != "" {
+			instance.Name = payload.Instance.Name
+		}
+		if payload.Instance.Driver != "" {
+			instance.Driver = payload.Instance.Driver
+		}
+		if payload.Instance.Type != "" {
+			instance.Type = payload.Instance.Type
+		}
+		if payload.Instance.Network.Mode != "" {
+			instance.Network.Mode = payload.Instance.Network.Mode
+		}
+		if payload.Instance.Network.IPv4 != "" {
+			instance.Network.IPv4 = payload.Instance.Network.IPv4
+		}
+		if payload.Instance.Network.MAC != "" {
+			instance.Network.MAC = payload.Instance.Network.MAC
+		}
+	}
+	d, err := s.registry.Resolve(r.Context(), instance.Driver)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	instance.Firewall = payload.Rules
+	if running, _ := d.Status(r.Context(), &instance); running == driver.StatusRunning {
+		instance.Status = driver.StatusRunning
+		if err := driver.ApplyFirewall(r.Context(), &instance); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
+	s.mu.Lock()
+	s.instances[id] = instance
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
 }
 
 // updateNATMappings 让被控按主控下发的全量清单对账 NAT 规则。实例运行中
