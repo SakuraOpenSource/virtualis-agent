@@ -39,6 +39,7 @@ type agentServer struct {
 	registry  *driver.Registry
 	mu        sync.RWMutex
 	instances map[uint]protocol.Instance
+	busy      map[uint]bool
 	metrics   map[uint]protocol.Metrics
 	// bootReady 记录创建/重装后的首次 root 密码注入是否已完成；重启 agent
 	// 后状态丢失，主控的下一次“配置网络”会重新校准，这里只求真实乐观。
@@ -193,6 +194,13 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "instance id/name required")
 		return
 	}
+	lease, ok := s.tryOperation(instance.ID)
+	if !ok {
+		writeError(w, http.StatusConflict, "instance operation in progress")
+		return
+	}
+	defer lease.done()
+	r = r.WithContext(context.WithValue(r.Context(), leaseKey{}, lease))
 	if instance.Image == nil && upload != nil {
 		instance.Image = &protocol.Image{OriginalName: filename, Driver: instance.Driver, Type: "disk"}
 	}
@@ -238,9 +246,11 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 	// 重活，同步做会拖爆创建请求的超时——丢后台执行，响应立即返回。
 	if instance.RootPassword != "" || instance.Status == driver.StatusRunning {
 		boot := instance
-		bootCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		bootCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
+		releaseBoot := retainOperation(r.Context())
 		go func() {
 			defer cancel()
+			defer releaseBoot()
 			if boot.RootPassword != "" && d.Name() != "qemu" {
 				s.markBootReady(boot.ID, false)
 				if err := d.SetRootPassword(bootCtx, &boot, boot.RootPassword); err != nil {
@@ -252,7 +262,7 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 			boot.RootPassword = ""
 			if boot.Status == driver.StatusRunning {
 				applyOrClearNAT(bootCtx, d, &boot, s, false)
-				applyFirewallIfRunning(bootCtx, &boot)
+				applyFirewallIfRunning(bootCtx, d, &boot)
 			}
 		}()
 	}
@@ -275,9 +285,26 @@ func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid instance id")
 		return
 	}
+	if !(r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "vnc" && parts[2] == "ws") {
+		lease, ok := s.tryOperation(id)
+		if !ok {
+			writeError(w, http.StatusConflict, "instance operation in progress")
+			return
+		}
+		defer lease.done()
+		r = r.WithContext(context.WithValue(r.Context(), leaseKey{}, lease))
+	}
 	switch {
 	case r.Method == http.MethodDelete && len(parts) == 1:
 		s.deleteInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "snapshots":
+		s.snapshotInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "export":
+		s.exportInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "import":
+		s.importInstance(w, r, id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "resize":
+		s.resizeInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "power":
 		s.powerInstance(w, r, id)
 	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "status":
@@ -392,9 +419,11 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 	if strings.EqualFold(strings.TrimSpace(action), "reinstall") &&
 		instance.RootPassword != "" && d.Name() != "qemu" {
 		boot := instance
-		bootCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		bootCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
+		releaseBoot := retainOperation(r.Context())
 		go func() {
 			defer cancel()
+			defer releaseBoot()
 			s.markBootReady(boot.ID, false)
 			if err := d.SetRootPassword(bootCtx, &boot, boot.RootPassword); err != nil {
 				log.Printf("实例 %d 重装后 root 密码注入失败: %v", boot.ID, err)
@@ -405,7 +434,7 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 		instance.RootPassword = ""
 	}
 	applyOrClearNAT(r.Context(), d, &instance, s, false)
-	applyFirewallIfRunning(r.Context(), &instance)
+	applyFirewallIfRunning(r.Context(), d, &instance)
 	s.mu.Lock()
 	s.instances[id] = instance
 	s.mu.Unlock()
@@ -436,7 +465,7 @@ func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id 
 	// 自愈：域可能在被控升级/重启前就处于运行状态（那时没有 NAT/防火墙
 	// 规则逻辑），状态查询是最频繁的请求，借它幂等对账规则，无需重启实例。
 	applyOrClearNAT(r.Context(), d, &instance, s, true)
-	applyFirewallIfRunning(r.Context(), &instance)
+	applyFirewallIfRunning(r.Context(), d, &instance)
 	instance.SSHReady = s.bootReadyOf(id)
 	s.mu.Lock()
 	s.instances[id] = instance
@@ -510,7 +539,23 @@ func (s *agentServer) networkInstance(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"network": network})
+	status, err := d.Status(r.Context(), &instance)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	instance.Driver, instance.Status = d.Name(), status
+	instance.ObservedIP = ""
+	if err := driver.ReconcileFirewall(r.Context(), d, &instance, &network); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	instance.RootPassword = ""
+	s.applyBootReady(&instance)
+	s.mu.Lock()
+	s.instances[id] = instance
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"network": network, "observed_ip": instance.ObservedIP})
 }
 
 // configureNetworkInstance synchronously reconciles guest readiness, runtime
@@ -606,6 +651,11 @@ func (s *agentServer) configureNetworkInstance(w http.ResponseWriter, r *http.Re
 	} else {
 		driver.ClearNATRules(r.Context(), id)
 	}
+	instance.ObservedIP = ""
+	if err := driver.ReconcileFirewall(r.Context(), d, &instance, &network); err != nil {
+		writeConfigureError(w, "firewall", err, status, ip, network)
+		return
+	}
 	instance.RootPassword = ""
 	s.mu.Lock()
 	s.instances[id] = instance
@@ -694,11 +744,11 @@ func applyOrClearNAT(ctx context.Context, d driver.Driver, instance *protocol.In
 
 // applyFirewallIfRunning 与 NAT 同一节奏：实例运行中就幂等重建防火墙链；
 // 停止状态不做处理（链挂在 FORWARD 上不产生流量，规则留待下次开机应用）。
-func applyFirewallIfRunning(ctx context.Context, instance *protocol.Instance) {
+func applyFirewallIfRunning(ctx context.Context, d driver.Driver, instance *protocol.Instance) {
 	if instance.Status != driver.StatusRunning {
 		return
 	}
-	if err := driver.ApplyFirewall(ctx, instance); err != nil {
+	if err := driver.ReconcileFirewall(ctx, d, instance, nil); err != nil {
 		log.Printf("实例 %d 应用防火墙规则失败: %v", instance.ID, err)
 	}
 }
@@ -744,9 +794,14 @@ func (s *agentServer) updateFirewallRules(w http.ResponseWriter, r *http.Request
 		return
 	}
 	instance.Firewall = payload.Rules
-	if running, _ := d.Status(r.Context(), &instance); running == driver.StatusRunning {
-		instance.Status = driver.StatusRunning
-		if err := driver.ApplyFirewall(r.Context(), &instance); err != nil {
+	running, err := d.Status(r.Context(), &instance)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	instance.Status = running
+	if running == driver.StatusRunning {
+		if err := driver.ReconcileFirewall(r.Context(), d, &instance, nil); err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -1048,7 +1103,7 @@ func parseInstance(r *http.Request) (protocol.Instance, io.Reader, string, io.Re
 			if extraFile != nil {
 				extraFile.Close()
 			}
-			cleanupMultipart(r)
+			cleanupMultipart(r)()
 		}
 		extraName := ""
 		if extraHeader != nil {
@@ -1090,7 +1145,7 @@ func parsePower(r *http.Request) (protocol.Instance, string, io.Reader, string, 
 			if extraFile != nil {
 				extraFile.Close()
 			}
-			cleanupMultipart(r)
+			cleanupMultipart(r)()
 		}
 		extraName := ""
 		if extraHeader != nil {
