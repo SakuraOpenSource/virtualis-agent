@@ -158,8 +158,7 @@ func (r *Registry) Capabilities(ctx context.Context) []Capability {
 }
 
 func run(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := output(ctx, name, args...)
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, strings.TrimSpace(string(out)))
 	}
@@ -167,7 +166,20 @@ func run(ctx context.Context, name string, args ...string) error {
 }
 
 func output(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if runner, ok := ctx.Value(commandRunnerKey{}).(CommandRunner); ok {
+		return runner(ctx, name, args...)
+	}
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+// CommandRunner is a request-scoped command seam. Production defaults to real
+// exec; tests can exercise host workflows without fake POSIX shell executables
+// or a racy process-global override.
+type CommandRunner func(context.Context, string, ...string) ([]byte, error)
+type commandRunnerKey struct{}
+
+func WithCommandRunner(ctx context.Context, runner CommandRunner) context.Context {
+	return context.WithValue(ctx, commandRunnerKey{}, runner)
 }
 
 func hasCommand(name string) bool {

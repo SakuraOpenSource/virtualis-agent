@@ -145,18 +145,27 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 
 func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 	name := resourceName("qemu", inst)
-	if !d.exists(ctx, name) {
-		return nil
-	}
-	_ = d.HardStop(ctx, inst)
-	// --remove-all-storage 连同 qcow2 一起清理；镜像文件由上层按需删除。
-	if err := run(ctx, "virsh", "undefine", name, "--remove-all-storage", "--nvram"); err != nil && !contains(err.Error(), "not found") {
+	exists, err := d.domainExists(ctx, name)
+	if err != nil {
 		return err
+	}
+	if exists {
+		if err := d.HardStop(ctx, inst); err != nil {
+			return err
+		}
+		// Delete only after the runtime is definitely stopped.
+		if err := requireStopped(ctx, d, inst); err != nil {
+			return err
+		}
+		if err := run(ctx, "virsh", "undefine", name, "--remove-all-storage", "--nvram"); err != nil && !contains(err.Error(), "not found") {
+			return err
+		}
 	}
 	d.mu.Lock()
 	delete(d.samples, inst.ID)
 	d.mu.Unlock()
 	removeTrafficState(d.dataDir, inst.ID)
+	_ = os.RemoveAll(d.snapshotDir(inst.ID))
 	return nil
 }
 
@@ -217,13 +226,17 @@ func (d *QEMU) Reinstall(ctx context.Context, inst *protocol.Instance) error {
 func (d *QEMU) Status(ctx context.Context, inst *protocol.Instance) (string, error) {
 	out, err := output(ctx, "virsh", "domstate", resourceName("qemu", inst))
 	if err != nil {
-		return StatusStopped, nil
+		return "", fmt.Errorf("读取 QEMU 状态失败: %w: %s", err, out)
 	}
 	state := strings.ToLower(strings.TrimSpace(string(out)))
-	if strings.Contains(state, "running") || strings.Contains(state, "paused") {
+	switch state {
+	case "shut off", "shutoff":
+		return StatusStopped, nil
+	case "running", "paused", "blocked", "in shutdown", "pmsuspended":
 		return StatusRunning, nil
+	default:
+		return "", fmt.Errorf("无法确认 QEMU 状态: %s", state)
 	}
-	return StatusStopped, nil
 }
 
 func (d *QEMU) Metrics(ctx context.Context, inst *protocol.Instance) (protocol.Metrics, error) {

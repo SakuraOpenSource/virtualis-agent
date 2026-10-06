@@ -37,12 +37,19 @@ func guestFirewallIP(inst *protocol.Instance) string {
 	if v := strings.TrimSpace(inst.Network.IPv4); v != "" {
 		return strings.Split(v, "/")[0]
 	}
+	if ip := net.ParseIP(inst.ObservedIP); ip != nil && ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
+		return ip.String()
+	}
 	return ""
 }
 
 // firewallRuleArgs 把一条规则翻译成 iptables 参数；返回 false 表示规则
 // 无效（乱填的协议/动作在落地端跳过而不是放行）。
 func firewallRuleArgs(chain string, rule protocol.FirewallRule) ([]string, bool) {
+	direction := strings.ToLower(strings.TrimSpace(rule.Direction))
+	if direction != "in" && direction != "out" {
+		return nil, false
+	}
 	action := strings.ToLower(strings.TrimSpace(rule.Action))
 	if action != "accept" && action != "drop" {
 		return nil, false
@@ -124,6 +131,13 @@ func buildFirewallPlan(chain, ip string, rules []protocol.FirewallRule) []firewa
 		if !ok {
 			continue
 		}
+		// Both FORWARD directions enter this chain; every rule must also bind
+		// its own instance endpoint or an inbound rule can allow/drop egress.
+		endpoint := "-d"
+		if strings.EqualFold(strings.TrimSpace(rule.Direction), "out") {
+			endpoint = "-s"
+		}
+		args = append(args[:2], append([]string{endpoint, ip}, args[2:]...)...)
 		if strings.EqualFold(strings.TrimSpace(rule.Direction), "out") {
 			hasOut = true
 		} else {
@@ -173,7 +187,7 @@ func ApplyFirewall(ctx context.Context, inst *protocol.Instance) error {
 		return fmt.Errorf("实例无效")
 	}
 	chain := FirewallChainName(inst.ID)
-	if !hasIPTables() {
+	if !commandAvailable(ctx, "iptables") {
 		hasRules := false
 		for _, rule := range inst.Firewall {
 			if rule.Enabled {

@@ -2,8 +2,7 @@ package driver
 
 import (
 	"context"
-	"os"
-	"path/filepath"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -199,81 +198,62 @@ func TestSelectStoragePool(t *testing.T) {
 	}
 }
 
-// writeFakeIncus 在 PATH 首位放置 fake incus，沿用本包已有的 fake CLI 模式。
-func writeFakeIncus(t *testing.T, script string) {
-	t.Helper()
-	dir := t.TempDir()
-	fake := filepath.Join(dir, "incus")
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
-}
-
+// Command seams are request-scoped: tests need neither POSIX shell executables
+// nor process-wide PATH mutation to exercise storage CLI responses.
 func TestListStoragePoolsPrefersQuotaCapable(t *testing.T) {
-	writeFakeIncus(t, "#!/bin/sh\n"+
-		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"list\" ]; then\n"+
-		"  printf '\"NAME\",\"DRIVER\"\\n\"default\",\"dir\"\\n\"fast\",\"btrfs\"\\n'\n"+
-		"  exit 0\n"+
-		"fi\n"+
-		"exit 1\n")
-	d := NewIncus()
-	pools := d.listStoragePools(context.Background())
+	ctx := WithCommandRunner(context.Background(), func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "storage" && args[1] == "list" {
+			return []byte("NAME,DRIVER\ndefault,dir\nfast,btrfs\n"), nil
+		}
+		return nil, errors.New("unexpected command: " + strings.Join(args, " "))
+	})
+	pools := NewIncus().listStoragePools(ctx)
 	if len(pools) != 2 || pools[0].driver != "dir" || pools[1].driver != "btrfs" {
 		t.Fatalf("listStoragePools() = %+v, want [{default dir} {fast btrfs}]", pools)
 	}
 	if sel, err := selectStoragePool(pools, 20); err != nil || sel != "fast" {
-		t.Fatalf("配额应选中 fast，得到 %q, %v", sel, err)
+		t.Fatalf("quota should use fast, got %q, %v", sel, err)
 	}
 }
 
 func TestListStoragePoolsDirOnlyQuotaFails(t *testing.T) {
-	writeFakeIncus(t, "#!/bin/sh\n"+
-		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"list\" ]; then\n"+
-		"  printf '\"NAME\",\"DRIVER\"\\n\"s1\",\"dir\"\\n'\n"+
-		"  exit 0\n"+
-		"fi\n"+
-		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"create\" ]; then\n"+
-		"  echo 'unexpected storage create' >&2\n"+
-		"  exit 1\n"+
-		"fi\n"+
-		"exit 1\n")
+	ctx := WithCommandRunner(context.Background(), func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "storage" && args[1] == "list" {
+			return []byte("NAME,DRIVER\ns1,dir\n"), nil
+		}
+		t.Errorf("must not create storage with an existing pool: %v", args)
+		return nil, errors.New("unexpected command")
+	})
 	d := NewIncus()
-	ctx := context.Background()
 	if _, err := d.ensureStoragePool(ctx, 20); err == nil || !strings.Contains(err.Error(), "不支持磁盘配额") {
-		t.Fatalf("ensureStoragePool(dir+配额) 应明确报错，得到 %v", err)
+		t.Fatalf("dir pool must reject quota, got %v", err)
 	}
-	// 无配额需求时 dir 池照常用，且不需要走到自动创建。
 	if sel, err := d.ensureStoragePool(ctx, 0); err != nil || sel != "s1" {
-		t.Fatalf("ensureStoragePool(dir+无配额) = %q, %v; want s1, nil", sel, err)
+		t.Fatalf("dir pool without quota = %q, %v; want s1, nil", sel, err)
 	}
 }
 
 func TestListStoragePoolsTableFallbackWithShow(t *testing.T) {
-	// 老版本不支持 -c n,driver：csv 失败 → 表格（无 DRIVER 列）→ storage show 补驱动。
-	writeFakeIncus(t, "#!/bin/sh\n"+
-		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"list\" ]; then\n"+
-		"  for a in \"$@\"; do\n"+
-		"    if [ \"$a\" = \"--format\" ]; then echo 'Error: unknown column' >&2; exit 1; fi\n"+
-		"  done\n"+
-		"  printf '+------+\\n| NAME |\\n+------+\\n| s1 |\\n+------+\\n'\n"+
-		"  exit 0\n"+
-		"fi\n"+
-		"if [ \"$1\" = \"storage\" ] && [ \"$2\" = \"show\" ]; then\n"+
-		"  printf 'name: s1\\ndriver: zfs\\nconfig: {}\\n'\n"+
-		"  exit 0\n"+
-		"fi\n"+
-		"exit 1\n")
-	pools := NewIncus().listStoragePools(context.Background())
+	ctx := WithCommandRunner(context.Background(), func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "storage" && args[1] == "list" {
+			for _, arg := range args {
+				if arg == "--format" {
+					return []byte("Error: unknown column"), errors.New("unsupported CSV format")
+				}
+			}
+			return []byte("+------+\n| NAME |\n+------+\n| s1 |\n+------+\n"), nil
+		}
+		if len(args) == 3 && args[0] == "storage" && args[1] == "show" && args[2] == "s1" {
+			return []byte("name: s1\ndriver: zfs\nconfig: {}\n"), nil
+		}
+		return nil, errors.New("unexpected command: " + strings.Join(args, " "))
+	})
+	pools := NewIncus().listStoragePools(ctx)
 	if len(pools) != 1 || pools[0].name != "s1" || pools[0].driver != "zfs" {
-		t.Fatalf("表格回退+show 补驱动失败: %+v", pools)
+		t.Fatalf("table fallback with driver lookup = %+v", pools)
 	}
 	if sel, err := selectStoragePool(pools, 10); err != nil || sel != "s1" {
-		t.Fatalf("zfs 池应承载配额，得到 %q, %v", sel, err)
+		t.Fatalf("zfs quota pool = %q, %v; want s1, nil", sel, err)
 	}
 }
 
@@ -306,19 +286,13 @@ func TestProfileHasDevice(t *testing.T) {
 }
 
 func TestProfileDeviceExistsPropagatesCommandErrors(t *testing.T) {
-	dir := t.TempDir()
-	fake := filepath.Join(dir, "incus")
-	script := "#!/bin/sh\nprintf 'profile unavailable' >&2\nexit 1\n"
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
-
-	_, err := profileDeviceExists(context.Background(), "incus", "p-1", "root")
+	ctx := WithCommandRunner(context.Background(), func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name != "incus" || !reflect.DeepEqual(args, []string{"query", "/1.0/profiles/p-1"}) {
+			t.Errorf("unexpected profile query: %s %v", name, args)
+		}
+		return []byte("profile unavailable"), errors.New("CLI command failed")
+	})
+	_, err := profileDeviceExists(ctx, "incus", "p-1", "root")
 	if err == nil || !strings.Contains(err.Error(), "profile unavailable") {
 		t.Fatalf("profileDeviceExists() error = %v, want command error", err)
 	}

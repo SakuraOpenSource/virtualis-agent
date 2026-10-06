@@ -112,7 +112,7 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 	// 每实例一个专用 profile 承载网络/资源限制：launch 的 -d 简写在
 	// Incus 6 上解析不可靠，profile device add 的位置参数语法最稳。
 	profile := fmt.Sprintf("virtualis-p-%d", inst.ID)
-	if err := d.ensureProfile(ctx, profile, inst.Network, inst); err != nil {
+	if err := d.ensureProfile(ctx, profile, inst.Network, inst, true); err != nil {
 		return err
 	}
 	args := []string{"launch", alias, name, "-p", profile}
@@ -142,7 +142,7 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 func (d *Incus) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) error {
 	name := resourceName("incus", inst)
 	profile := fmt.Sprintf("virtualis-p-%d", inst.ID)
-	if err := d.ensureProfile(ctx, profile, inst.Network, inst); err != nil {
+	if err := d.ensureProfile(ctx, profile, inst.Network, inst, true); err != nil {
 		return err
 	}
 	if err := run(ctx, d.cli(), "profile", "assign", name, profile); err != nil && !contains(err.Error(), "already assigned") {
@@ -171,7 +171,7 @@ func (d *Incus) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) e
 }
 
 // 幂等：profile 已存在时仅重建设备定义。
-func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig, inst *protocol.Instance) error {
+func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig, inst *protocol.Instance, allowDedicatedPool bool) error {
 	if err := run(ctx, d.cli(), "profile", "create", profile); err != nil && !contains(err.Error(), "already exists") {
 		return fmt.Errorf("创建实例 profile 失败: %w", err)
 	}
@@ -201,7 +201,9 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		// 新实例：优先每实例独立 btrfs 回环池（大小=磁盘配额）。独立池上
 		// 容器内 df 看到的就是真实配额、写满被真实拦截；共享池上 df 只能
 		// 显示池大小，用户会误以为配额没生效。独立池建不出再退回共享配额池。
-		if inst.Spec.DiskGB > 0 {
+		// 导入路径禁用：备份自带已有磁盘，复用目标节点现存配额池即可，
+		// 不得为导入临时创建专享池（失败时还会把池泄漏在目标节点上）。
+		if allowDedicatedPool && inst.Spec.DiskGB > 0 {
 			if dedicated, derr := d.ensureDedicatedPool(ctx, inst.ID, inst.Spec.DiskGB); derr == nil {
 				pool = dedicated
 			} else {
@@ -921,10 +923,22 @@ func (d *Incus) Status(ctx context.Context, inst *protocol.Instance) (string, er
 	if err != nil {
 		return "", fmt.Errorf("读取 Incus 实例状态失败: %w", err)
 	}
-	if strings.Contains(strings.ToLower(string(out)), "running") {
-		return StatusRunning, nil
+	name := resourceName("incus", inst)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.Split(line, ",")
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) != name {
+			continue
+		}
+		switch strings.ToUpper(strings.TrimSpace(parts[1])) {
+		case "STOPPED":
+			return StatusStopped, nil
+		case "RUNNING", "FROZEN", "STARTING", "STOPPING":
+			return StatusRunning, nil
+		default:
+			return "", fmt.Errorf("无法确认 Incus 状态: %s", parts[1])
+		}
 	}
-	return StatusStopped, nil
+	return "", fmt.Errorf("Incus 实例不存在或状态不可确认")
 }
 
 // incusState 是 incus query .../state 里采集需要字段的子集。
