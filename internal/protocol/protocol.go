@@ -87,7 +87,9 @@ type Instance struct {
 	ImageID     *uint         `json:"image_id,omitempty"`
 	Spec        InstanceSpec  `json:"spec"`
 	Network     NetworkConfig `json:"network"`
-	Image       *Image        `json:"image,omitempty"`
+	// ObservedIP is runtime-only: never promote a DHCP lease to desired IPv4.
+	ObservedIP string `json:"observed_ip,omitempty"`
+	Image      *Image `json:"image,omitempty"`
 	// NATMappings 是主控落库的期望清单，被控开机时据此配置 DNAT，
 	// 关机/删除时清除。整表下发，由被控幂等对账。
 	NATMappings []NATMapping `json:"nat_mappings,omitempty"`
