@@ -127,6 +127,11 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 		return err
 	}
 	d.ensureImageAliasCleaned(ctx, alias)
+	// launch 不经过 Start；独立 NIC 必须先禁用镜像 DHCP 并持久化地址、
+	// 路由和 DNS，后台 SSH 安装才有网络可用。
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+		return d.persistDedicatedGuest(ctx, inst)
+	}
 	// 创建时就地确认网络已注册（静态 IPv4 真的拿到手），不留到首次使用。
 	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat && inst.Network.IPv4 != "" {
 		if err := d.ensureContainerIPv4(ctx, name, inst.Network.IPv4); err != nil {
@@ -920,7 +925,13 @@ func (d *Incus) Stop(ctx context.Context, inst *protocol.Instance) error {
 	return cleanupDedicated(ctx, d.dataDir, inst.ID)
 }
 func (d *Incus) Restart(ctx context.Context, inst *protocol.Instance) error {
-	return run(ctx, d.cli(), "restart", resourceName("incus", inst))
+	if err := run(ctx, d.cli(), "restart", resourceName("incus", inst)); err != nil {
+		return err
+	}
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+		return d.persistDedicatedGuest(ctx, inst)
+	}
+	return nil
 }
 func (d *Incus) HardStart(ctx context.Context, inst *protocol.Instance) error {
 	return d.Start(ctx, inst)
@@ -1301,7 +1312,13 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 				}
 			}
 		}
-		if ipv4 == "" && inst.Network.IPv4 != "" {
+		if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+			// 独立 NIC 没有 DHCP；重试 SSH 引导也必须恢复静态网络和 DNS，
+			// 不能套用 incusbr0 的 NAT /24 地址及网关兜底。
+			if err := d.persistDedicatedGuest(ctx, inst); err != nil {
+				return fmt.Errorf("安装 sshd 前配置独立网络失败: %w", err)
+			}
+		} else if ipv4 == "" && inst.Network.IPv4 != "" {
 			if err := d.ensureContainerIPv4(ctx, name, inst.Network.IPv4); err != nil {
 				return fmt.Errorf("安装 sshd 前配置 IPv4 失败: %w", err)
 			}
