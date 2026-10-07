@@ -466,6 +466,7 @@ func (s *agentServer) statusInstance(w http.ResponseWriter, r *http.Request, id 
 	// 规则逻辑），状态查询是最频繁的请求，借它幂等对账规则，无需重启实例。
 	applyOrClearNAT(r.Context(), d, &instance, s, true)
 	applyFirewallIfRunning(r.Context(), d, &instance)
+	reconcileOwnedNetworkResources(r.Context(), d, &instance)
 	instance.SSHReady = s.bootReadyOf(id)
 	s.mu.Lock()
 	s.instances[id] = instance
@@ -753,6 +754,14 @@ func applyFirewallIfRunning(ctx context.Context, d driver.Driver, instance *prot
 	}
 }
 
+// reconcileOwnedNetworkResources reapplies instance-owned host networking and
+// protection while running, and removes it once the guest is verified stopped.
+func reconcileOwnedNetworkResources(ctx context.Context, d driver.Driver, instance *protocol.Instance) {
+	if err := driver.ReconcileNetworkResources(ctx, d, instance); err != nil {
+		log.Printf("实例 %d 独立网络资源对账失败: %v", instance.ID, err)
+	}
+}
+
 // updateFirewallRules 让被控按主控下发的全量清单对账实例防火墙。
 func (s *agentServer) updateFirewallRules(w http.ResponseWriter, r *http.Request, id uint) {
 	var payload struct {
@@ -794,6 +803,7 @@ func (s *agentServer) updateFirewallRules(w http.ResponseWriter, r *http.Request
 		return
 	}
 	instance.Firewall = payload.Rules
+	instance.FirewallPolicy = payload.Instance.FirewallPolicy
 	running, err := d.Status(r.Context(), &instance)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())

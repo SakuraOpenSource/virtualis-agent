@@ -15,6 +15,7 @@ type InstanceSpec struct {
 
 type NetworkConfig struct {
 	Mode          string   `json:"mode"`
+	DedicatedMode string   `json:"dedicated_mode,omitempty"`
 	Bridge        string   `json:"bridge,omitempty"`
 	MAC           string   `json:"mac,omitempty"`
 	IPv4          string   `json:"ipv4,omitempty"`
@@ -94,13 +95,19 @@ type Instance struct {
 	// 关机/删除时清除。整表下发，由被控幂等对账。
 	NATMappings []NATMapping `json:"nat_mappings,omitempty"`
 	// Firewall 是该实例的防火墙规则清单（整表下发，幂等对账）。
-	Firewall []FirewallRule `json:"firewall,omitempty"`
+	Firewall       []FirewallRule  `json:"firewall,omitempty"`
+	FirewallPolicy *FirewallPolicy `json:"firewall_policy,omitempty"`
 	// RootPassword 只在创建请求里出现：agent 把它写进系统盘（QEMU）或
 	// 直接 chpasswd（容器），之后不再传输，也不出现在状态回包中。
 	RootPassword string `json:"root_password,omitempty"`
 	// SSHReady 是被控的回包字段：首次密码注入（含 sshd 可用性校验）完成后
 	// 置 true，主控据此回写实例的 ssh_ready。创建/重装请求里传不传都忽略。
 	SSHReady bool `json:"ssh_ready,omitempty"`
+}
+
+type FirewallPolicy struct {
+	Ingress string `json:"ingress"`
+	Egress  string `json:"egress"`
 }
 
 type Metrics struct {

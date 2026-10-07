@@ -183,40 +183,7 @@ func removeChainJumps(ctx context.Context, chain string) {
 // ApplyFirewall 把实例的规则清单幂等落到宿主机 iptables；清单为空等同于
 // 清除（链保留但不再挂跳转）。任何失败都会返回错误交给调用方记录。
 func ApplyFirewall(ctx context.Context, inst *protocol.Instance) error {
-	if inst == nil || inst.ID == 0 {
-		return fmt.Errorf("实例无效")
-	}
-	chain := FirewallChainName(inst.ID)
-	if !commandAvailable(ctx, "iptables") {
-		hasRules := false
-		for _, rule := range inst.Firewall {
-			if rule.Enabled {
-				hasRules = true
-				break
-			}
-		}
-		if !hasRules {
-			return nil
-		}
-		return fmt.Errorf("宿主机缺少 iptables，无法应用防火墙规则")
-	}
-	ip := guestFirewallIP(inst)
-	ops := buildFirewallPlan(chain, ip, inst.Firewall)
-	hasRules := len(ops) > 2
-	if hasRules && ip == "" {
-		return fmt.Errorf("实例 %d 缺少可用于防火墙匹配的 IP，规则未应用", inst.ID)
-	}
-	// 先摘掉旧跳转，再全量重建：方向变化（入向 ↔ 出向）时不会残留。
-	removeChainJumps(ctx, chain)
-	for _, op := range ops {
-		if len(op.Check) > 0 && run(ctx, "iptables", op.Check...) == nil {
-			continue
-		}
-		if err := run(ctx, "iptables", op.Args...); err != nil && !op.IgnoreError {
-			return fmt.Errorf("应用防火墙规则失败: %w", err)
-		}
-	}
-	return nil
+	return replaceFirewall(ctx, inst)
 }
 
 // ClearFirewall 彻底清理实例的防火墙链（删除实例时调用）。宿主机没有

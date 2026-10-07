@@ -172,6 +172,21 @@ func (d *Incus) ConfigureNetwork(ctx context.Context, inst *protocol.Instance) e
 
 // 幂等：profile 已存在时仅重建设备定义。
 func (d *Incus) ensureProfile(ctx context.Context, profile string, network protocol.NetworkConfig, inst *protocol.Instance, allowDedicatedPool bool) error {
+	var attachment dedicatedAttachment
+	if NormalizeNetworkMode(network.Mode) == NetworkModeDedicated {
+		var err error
+		attachment, err = resolveDedicated(ctx, network)
+		if err != nil {
+			return err
+		}
+		if attachment.Mode == "routed" {
+			if err = requireSysctl(ctx, "net.ipv4.conf."+attachment.Uplink+".forwarding"); err != nil {
+				return err
+			}
+		} else if err = ensureBridgeFiltering(ctx); err != nil {
+			return err
+		}
+	}
 	if err := run(ctx, d.cli(), "profile", "create", profile); err != nil && !contains(err.Error(), "already exists") {
 		return fmt.Errorf("创建实例 profile 失败: %w", err)
 	}
@@ -256,14 +271,8 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 	managed := true
 	switch mode {
 	case NetworkModeDedicated:
-		target, _, err := dedicatedTarget(network)
-		if err == nil && target != "" {
-			parent = target
-		} else if v := strings.TrimSpace(network.Bridge); v != "" {
-			parent = v
-		}
-		// 独立网卡的目标可能是宿主机物理口等非托管桥：只有托管网络才走 network=。
-		managed = d.isManagedNetwork(ctx, parent)
+		parent = attachment.Uplink
+		managed = attachment.Mode == "bridge" && d.isManagedNetwork(ctx, parent)
 	case NetworkModeVPC:
 		// VPC 网络是主控创建的托管网络，必须用 network= 挂载；不存在时
 		// 直接报错，而不是静默挂到默认桥产生越界的实例。
@@ -276,13 +285,23 @@ func (d *Incus) ensureProfile(ctx context.Context, profile string, network proto
 		}
 	}
 	var spec []string
-	if managed {
+	if mode == NetworkModeDedicated && attachment.Mode == "routed" {
+		args := incusEth0UnmanagedArgs(network, parent)
+		args[0] = "nictype=routed"
+		args = append(args, "name=eth0", "host_name="+ownedNIC(inst.ID), "ipv4.address="+attachment.IP, "ipv4.host_address="+routedGateway)
+		spec = append([]string{"profile", "device", "add", profile, "eth0", "nic"}, args...)
+	} else if managed {
 		spec = append([]string{"profile", "device", "add", profile, "eth0", "nic"}, incusEth0DeviceArgs(network, parent)...)
 	} else {
 		spec = append([]string{"profile", "device", "add", profile, "eth0", "nic"}, incusEth0UnmanagedArgs(network, parent)...)
 	}
 	if err := run(ctx, d.cli(), spec...); err != nil {
 		return fmt.Errorf("配置网络设备失败: %w", err)
+	}
+	if mode == NetworkModeDedicated && attachment.Mode == "bridge" {
+		if err := run(ctx, d.cli(), "profile", "device", "set", profile, "eth0", "host_name="+ownedNIC(inst.ID), "name=eth0"); err != nil {
+			return err
+		}
 	}
 	d.ensureLxcfsDevices(ctx, profile)
 	d.ensureCPUViewDevices(ctx, profile, inst)
@@ -863,10 +882,22 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 	// 老实例（root 在共享池上）删除 vdisk-N 会报 not found，忽略即可。
 	_ = run(ctx, d.cli(), "storage", "delete", dedicatedPoolName(inst.ID))
 	removeTrafficState(d.dataDir, inst.ID)
+	// 独立网络宿主侧资源（防伪造链/所有权记录）随实例一并清理。
+	if err := cleanupDedicated(ctx, d.dataDir, inst.ID); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (d *Incus) Start(ctx context.Context, inst *protocol.Instance) error {
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+		if err := d.ensureProfile(ctx, fmt.Sprintf("virtualis-p-%d", inst.ID), inst.Network, inst, false); err != nil {
+			return err
+		}
+		if err := d.ensureDedicatedProtection(ctx, inst); err != nil {
+			return err
+		}
+	}
 	// 存量实例下次开机也能拿到正确的 sysfs CPU 视图（profile 设备在 start
 	// 展开时生效）；文件与设备都已就位时是纯 no-op。
 	d.ensureCPUViewDevices(ctx, fmt.Sprintf("virtualis-p-%d", inst.ID), inst)
@@ -874,6 +905,9 @@ func (d *Incus) Start(ctx context.Context, inst *protocol.Instance) error {
 	// launch 创建的实例一落地就在运行，"already running" 视为成功。
 	if err != nil && !contains(err.Error(), "already running") {
 		return err
+	}
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+		return d.persistDedicatedGuest(ctx, inst)
 	}
 	return nil
 }
@@ -883,7 +917,7 @@ func (d *Incus) Stop(ctx context.Context, inst *protocol.Instance) error {
 	if err != nil && !contains(err.Error(), "not running") {
 		return err
 	}
-	return nil
+	return cleanupDedicated(ctx, d.dataDir, inst.ID)
 }
 func (d *Incus) Restart(ctx context.Context, inst *protocol.Instance) error {
 	return run(ctx, d.cli(), "restart", resourceName("incus", inst))
@@ -893,7 +927,10 @@ func (d *Incus) HardStart(ctx context.Context, inst *protocol.Instance) error {
 }
 func (d *Incus) HardStop(ctx context.Context, inst *protocol.Instance) error {
 	containerVNC.stop(d.Name(), inst)
-	return run(ctx, d.cli(), "stop", resourceName("incus", inst), "--force")
+	if err := run(ctx, d.cli(), "stop", resourceName("incus", inst), "--force"); err != nil && !contains(err.Error(), "not running") && !contains(err.Error(), "not found") {
+		return err
+	}
+	return cleanupDedicated(ctx, d.dataDir, inst.ID)
 }
 func (d *Incus) HardRestart(ctx context.Context, inst *protocol.Instance) error {
 	if err := d.HardStop(ctx, inst); err != nil {

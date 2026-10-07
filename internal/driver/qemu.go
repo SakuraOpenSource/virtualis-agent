@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
+
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -61,7 +61,7 @@ func (d *QEMU) Probe(_ context.Context) error {
 // （ISO 走 cdrom），最后生成 domain XML 写入 libvirt。启动由 Start 完成，
 // ISO 存在时从光驱优先引导。
 func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
-	if !hasCommand("virsh") {
+	if !commandAvailable(ctx, "virsh") {
 		return fmt.Errorf("virsh 未安装，无法创建 QEMU 实例")
 	}
 	if err := d.ensureNetwork(ctx, inst); err != nil {
@@ -113,6 +113,22 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 		}
 	}
 
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+		if isoPath != "" {
+			return fmt.Errorf("独立网络需要可离线配置的 Linux 系统盘，不支持空白 ISO 安装盘")
+		}
+		a, err := resolveDedicated(ctx, inst.Network)
+		if err != nil {
+			return err
+		}
+		if inst.Network.MAC == "" {
+			inst.Network.MAC = natMAC(inst)
+		}
+		if err := injectDedicatedGuest(ctx, diskPath, inst.Network, a); err != nil {
+			return err
+		}
+	}
+
 	// NAT 模式：派生确定性 MAC 并在 libvirt 网络里做静态 DHCP 保留，
 	// 让实例每次都拿到同一 IP，NAT 映射的目标地址才稳定。保留失败
 	// （老版本 libvirt 等）不阻塞创建，映射走动态解析回退。
@@ -126,7 +142,16 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 		}
 	}
 
-	xml := domainXML(name, inst, diskPath, isoPath)
+	runtime := *inst
+	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeDedicated {
+		a, err := resolveDedicated(ctx, inst.Network)
+		if err != nil {
+			return err
+		}
+		runtime.Network.DedicatedMode = a.Mode
+		runtime.Network.Bridge = a.Uplink
+	}
+	xml := domainXML(name, &runtime, diskPath, isoPath)
 	tmp, err := os.CreateTemp("", "virtualis-domain-*.xml")
 	if err != nil {
 		return err
@@ -166,7 +191,9 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 	d.mu.Unlock()
 	removeTrafficState(d.dataDir, inst.ID)
 	_ = os.RemoveAll(d.snapshotDir(inst.ID))
-	return nil
+	// 独立网络宿主侧资源（owned 桥/路由/proxy ARP/防伪造链/所有权记录）
+	// 随硬删除一并回收；域不存在时也要按记录清理。
+	return cleanupDedicated(ctx, d.dataDir, inst.ID)
 }
 
 func (d *QEMU) Start(ctx context.Context, inst *protocol.Instance) error {
@@ -189,16 +216,36 @@ func (d *QEMU) Start(ctx context.Context, inst *protocol.Instance) error {
 	return err
 }
 func (d *QEMU) Stop(ctx context.Context, inst *protocol.Instance) error {
-	return d.action(ctx, "shutdown", inst, "not active", "Domain not found")
+	if err := d.action(ctx, "shutdown", inst, "not active", "Domain not found"); err != nil {
+		return err
+	}
+	if record, err := loadDedicatedRecord(d.dataDir, inst.ID); err != nil {
+		return err
+	} else if record != nil {
+		status, err := d.Status(ctx, inst)
+		if err != nil {
+			return err
+		}
+		if status == StatusStopped {
+			return cleanupDedicated(ctx, d.dataDir, inst.ID)
+		}
+	}
+	return nil
 }
 func (d *QEMU) Restart(ctx context.Context, inst *protocol.Instance) error {
+	if err := d.ensureNetwork(ctx, inst); err != nil {
+		return err
+	}
 	return d.action(ctx, "reboot", inst)
 }
 func (d *QEMU) HardStart(ctx context.Context, inst *protocol.Instance) error {
 	return d.Start(ctx, inst)
 }
 func (d *QEMU) HardStop(ctx context.Context, inst *protocol.Instance) error {
-	return d.action(ctx, "destroy", inst, "not active", "Domain not found")
+	if err := d.action(ctx, "destroy", inst, "not active", "Domain not found"); err != nil {
+		return err
+	}
+	return cleanupDedicated(ctx, d.dataDir, inst.ID)
 }
 func (d *QEMU) HardRestart(ctx context.Context, inst *protocol.Instance) error {
 	if err := d.HardStop(ctx, inst); err != nil {
@@ -738,7 +785,8 @@ func (d *QEMU) action(ctx context.Context, action string, inst *protocol.Instanc
 }
 
 func (d *QEMU) exists(ctx context.Context, name string) bool {
-	return exec.CommandContext(ctx, "virsh", "dominfo", name).Run() == nil
+	_, err := output(ctx, "virsh", "dominfo", name)
+	return err == nil
 }
 
 // ensureNetwork 保证所选网络模式的基础设施就绪。
@@ -766,13 +814,7 @@ func (d *QEMU) ensureNetwork(ctx context.Context, inst *protocol.Instance) error
 		}
 		return nil
 	case NetworkModeDedicated:
-		if _, _, err := dedicatedTarget(inst.Network); err != nil {
-			return err
-		}
-		if !DedicatedReady() {
-			return fmt.Errorf("独立 IP 模式要求主机拥有至少 2 个 IPv4 地址，当前不满足")
-		}
-		return nil
+		return ensureQEMUDedicated(ctx, inst, d.dataDir)
 	}
 	return nil
 }
@@ -878,7 +920,7 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
     </disk>
 `, html.EscapeString(isoPath))
 	}
-	b.WriteString(qemuInterfaceXML(inst.Network))
+	b.WriteString(qemuInstanceInterfaceXML(inst))
 	b.WriteString(`    <controller type='scsi' index='0' model='virtio-scsi'/>
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
