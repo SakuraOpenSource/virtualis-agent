@@ -989,3 +989,6 @@ func bandwidthXML(mbps int) string {
 	average := mbps * 1000
 	return fmt.Sprintf("<bandwidth><inbound average='%d' peak='%d'/><outbound average='%d' peak='%d'/></bandwidth>", average, average, average, average)
 }
+
+// firewallPolicyCapable 声明 qemu 驱动支持事务化防火墙策略下发。
+func (d *QEMU) firewallPolicyCapable() bool { return true }

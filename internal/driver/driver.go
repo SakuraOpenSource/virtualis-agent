@@ -59,6 +59,16 @@ type Capability struct {
 	Name      string `json:"name"`
 	Available bool   `json:"available"`
 	Error     string `json:"error,omitempty"`
+	// FirewallPolicy 表示驱动支持事务化默认策略下发（iptables-restore 单事务
+	// 替换 + 失败回滚）。主控在实例携带 firewall_policy 时会校验该位，旧被控
+	// 缺字段即 false，创建被拒绝而不是静默忽略默认拒绝语义。
+	FirewallPolicy bool `json:"firewall_policy"`
+}
+
+// policyCapable 由实现 FirewallPolicy 事务下发的驱动声明。incus/qemu 均已实现；
+// probe 失败（二进制缺失）时 Available=false，本标志不参与该判断。
+type policyCapable interface {
+	firewallPolicyCapable() bool
 }
 
 // Registry 按名字管理驱动，并支持 auto 时按 Probe 顺序自动选择。
@@ -145,6 +155,9 @@ func (r *Registry) Capabilities(ctx context.Context) []Capability {
 	for _, name := range r.Names() {
 		d, _ := r.Get(name)
 		item := Capability{Name: name}
+		if pc, ok := d.(policyCapable); ok {
+			item.FirewallPolicy = pc.firewallPolicyCapable()
+		}
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		err := d.Probe(probeCtx)
 		cancel()

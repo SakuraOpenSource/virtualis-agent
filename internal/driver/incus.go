@@ -1396,3 +1396,6 @@ func parseMiB(line string) int64 {
 	}
 	return 0
 }
+
+// firewallPolicyCapable 声明 incus 驱动支持事务化防火墙策略下发。
+func (d *Incus) firewallPolicyCapable() bool { return true }
