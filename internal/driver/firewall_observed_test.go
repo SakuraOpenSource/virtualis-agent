@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
+	"os"
 	"strings"
 	"testing"
 )
@@ -19,7 +20,12 @@ func (d *observedNetworkDriver) Network(context.Context, *protocol.Instance) (pr
 }
 func TestDHCPFirewallReconciliationUsesObservedAddressAndRemovesOldJumps(t *testing.T) {
 	calls := []string{}
-	ctx := WithCommandRunner(context.Background(), func(_ context.Context, _ string, a ...string) ([]byte, error) {
+	ctx := WithCommandRunner(context.Background(), func(_ context.Context, name string, a ...string) ([]byte, error) {
+		if name == "iptables-restore" {
+			b, err := os.ReadFile(a[len(a)-1])
+			calls = append(calls, string(b))
+			return nil, err
+		}
 		calls = append(calls, strings.Join(a, " "))
 		if a[0] == "-S" {
 			return []byte("-A FORWARD -d 10.1.0.8 -j VIRTIS-FW-1\n"), nil
