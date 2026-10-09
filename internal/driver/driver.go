@@ -52,7 +52,7 @@ type Driver interface {
 // libvirt 派随机地址），代码里派生的 MAC 与实际网卡不一致会让静态保留
 // 永远等不到匹配的客户端，实例拿不到保留 IP。
 type NATIdentityReconciler interface {
-	EnsureNATIdentity(ctx context.Context, inst *protocol.Instance)
+	EnsureNATIdentity(ctx context.Context, inst *protocol.Instance) error
 }
 
 type Capability struct {
@@ -63,6 +63,8 @@ type Capability struct {
 	// 替换 + 失败回滚）。主控在实例携带 firewall_policy 时会校验该位，旧被控
 	// 缺字段即 false，创建被拒绝而不是静默忽略默认拒绝语义。
 	FirewallPolicy bool `json:"firewall_policy"`
+	SnapshotDiskOnlyRestore bool `json:"snapshot_disk_only_restore"`
+	RecoveryError string `json:"recovery_error,omitempty"`
 }
 
 // policyCapable 由实现 FirewallPolicy 事务下发的驱动声明。incus/qemu 均已实现；
@@ -160,6 +162,11 @@ func (r *Registry) Capabilities(ctx context.Context) []Capability {
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		err := d.Probe(probeCtx)
+		if capability, ok := d.(interface{snapshotDiskOnlyCapable(context.Context)(bool,error)}); ok && err == nil {
+			supported, recoveryErr := capability.snapshotDiskOnlyCapable(probeCtx)
+			item.SnapshotDiskOnlyRestore = supported
+			if recoveryErr != nil { item.RecoveryError = recoveryErr.Error() }
+		}
 		cancel()
 		item.Available = err == nil
 		if err != nil {
