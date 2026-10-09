@@ -113,7 +113,7 @@ func ApplyNATRules(ctx context.Context, d Driver, inst *protocol.Instance, resol
 	// 先对账 NAT 身份（真实 MAC ↔ DHCP 保留 ↔ 静态地址）：旧版本创建的
 	// 实例在这里自愈，随后解析到的静态 IP 才可信。
 	if reconciler, ok := d.(NATIdentityReconciler); ok {
-		reconciler.EnsureNATIdentity(ctx, inst)
+		if err := reconciler.EnsureNATIdentity(ctx, inst); err != nil { return 0,err }
 	}
 	guestIP := ResolveGuestIP(ctx, d, inst, resolveRetries, resolveIntervalSec)
 	if guestIP == "" {
