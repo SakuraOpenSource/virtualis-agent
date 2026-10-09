@@ -96,7 +96,10 @@ func (d *Incus) Create(ctx context.Context, inst *protocol.Instance) error {
 		if inst.Network.IPv4 == "" {
 			// Incus 容器挂 incusbr0，保留地址必须落在它的子网内。
 			// 网桥不存在时直接失败，不再用硬编码 10.10.10.x 盲 launch。
-			reserved, _ := natSlotIPOn("incusbr0", inst)
+			reserved, allocationErr := allocateNATIP(ctx, d.dataDir, d.Name(), "incusbr0", inst)
+			if allocationErr != nil {
+				return allocationErr
+			}
 			if reserved == "" {
 				return fmt.Errorf("NAT 网桥 incusbr0 不存在或无 IPv4 地址，无法分配保留 IP")
 			}
@@ -891,6 +894,11 @@ func (d *Incus) Delete(ctx context.Context, inst *protocol.Instance) error {
 	if err := cleanupDedicated(ctx, d.dataDir, inst.ID); err != nil {
 		return err
 	}
+	// AGT-F7: return the persisted NAT slot to the pool; without this the
+	// 140-slot managed range leaks on every delete until exhaustion.
+	if err := releaseNATAllocation(d.dataDir, d.Name(), inst.ID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1240,8 +1248,11 @@ func (d *Incus) ensureContainerIPv4(ctx context.Context, name, expectIP string) 
 	// natSlotIPOn 返回 (guestIP, gatewayIP)，这里必须取第二个值；
 	// 旧代码误用 guestIP（如 10.10.10.101）作网关，会让容器失去外网，
 	// 随后的 openssh-server 安装必然失败。
-	_, gateway := natSlotIPOn("incusbr0", &protocol.Instance{ID: 1})
-	gw := gateway
+	gateway, _, bridgeErr := bridgeIPv4(ctx, "incusbr0")
+	if bridgeErr != nil {
+		return bridgeErr
+	}
+	gw := gateway.String()
 	ip := strings.Split(expectIP, "/")[0]
 	// Alpine 等精简镜像可能只有 busybox：iproute2 的 ip 不存在时回退
 	// ifconfig/route（busybox 自带），保证静态兜底仍可落盘。
@@ -1351,14 +1362,21 @@ func (d *Incus) SetRootPassword(ctx context.Context, inst *protocol.Instance, pa
 	if err := exec(ctx, "sh", "-c", "echo root:"+shellQuote(password)+" | chpasswd"); err != nil {
 		return fmt.Errorf("设置 root 密码失败: %w", err)
 	}
-	// 双写登录配置：Debian/Ubuntu 走 sshd_config.d drop-in；Alpine 等
-	// 精简镜像的 sshd_config 没有 Include，drop-in 会被忽略，因此同时
-	// sed 原地改写主配置（无该指令行时追加）。
+	// AGT-F6: keep the drop-in, but make the in-place rewrite robust and
+	// idempotent: normalize ANY existing directive line regardless of leading
+	// whitespace, comment markers or case (the legacy grep '^PermitRootLogin'
+	// missed those, so an appended line stayed shadowed by an earlier
+	// effective directive). The drop-in alone is not trusted because Alpine
+	// images ship sshd_config without an Include directive.
 	config := "mkdir -p /etc/ssh/sshd_config.d && printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/00-virtualis.conf; " +
-		"sed -i -E 's/^#?[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null; " +
-		"grep -q '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config; " +
-		"sed -i -E 's/^#?[[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null; " +
-		"grep -q '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config"
+		"for d in PermitRootLogin PasswordAuthentication; do " +
+		// awk matches case-insensitively via tolower(), covering indented,
+		// commented and mixed-case directive lines the legacy sed/grep pair
+		// missed; the effective directive is rewritten in place, preserving
+		// order, so no shadowing duplicate is appended.
+		"awk -v key=\"$d\" 'tolower($0) ~ \"^[[:space:]]*#?[[:space:]]*\" tolower(key) \"[[:space:]]\" {print key \" yes\"; next} {print}' /etc/ssh/sshd_config > /etc/ssh/sshd_config.new 2>/dev/null && mv /etc/ssh/sshd_config.new /etc/ssh/sshd_config; " +
+		"grep -qi '^[[:space:]]*#*[[:space:]]*'\"$d\"'[[:space:]]' /etc/ssh/sshd_config 2>/dev/null || printf '%s yes\\n' \"$d\" >> /etc/ssh/sshd_config; " +
+		"done"
 	if err := exec(ctx, "sh", "-c", config); err != nil {
 		return fmt.Errorf("写入 SSH 登录配置失败: %w", err)
 	}
