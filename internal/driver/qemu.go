@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"html"
 	"log"
@@ -61,6 +62,15 @@ func (d *QEMU) Probe(_ context.Context) error {
 // （ISO 走 cdrom），最后生成 domain XML 写入 libvirt。启动由 Start 完成，
 // ISO 存在时从光驱优先引导。
 func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
+	if inst.Image != nil {
+		for _, path := range []string{inst.Image.Path, inst.Image.ExtraPath} {
+			if path != "" {
+				if err := ManagedImagePath(d.dataDir, path); err != nil {
+					return fmt.Errorf("unsafe image path: %w", err)
+				}
+			}
+		}
+	}
 	if !commandAvailable(ctx, "virsh") {
 		return fmt.Errorf("virsh 未安装，无法创建 QEMU 实例")
 	}
@@ -136,8 +146,14 @@ func (d *QEMU) Create(ctx context.Context, inst *protocol.Instance) error {
 		if inst.Network.MAC == "" {
 			inst.Network.MAC = natMAC(inst)
 		}
-		reserved, _ := natSlotIP(inst)
-		if reserved != "" && d.reserveNATIP(ctx, inst.Network.MAC, reserved) {
+		reserved, allocationErr := allocateNATIP(ctx, d.dataDir, d.Name(), "virbr0", inst)
+		if allocationErr != nil {
+			return allocationErr
+		}
+		if !d.reserveNATIP(ctx, inst.Network.MAC, reserved) {
+			return fmt.Errorf("NAT DHCP reservation failed")
+		}
+		if reserved != "" {
 			inst.Network.IPv4 = reserved
 		}
 	}
@@ -174,7 +190,39 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 	if err != nil {
 		return err
 	}
+	volumes := []string{}
 	if exists {
+		raw, readErr := output(ctx, "virsh", "dumpxml", name, "--inactive")
+		if readErr != nil {
+			return fmt.Errorf("cannot inspect storage before deletion: %w", readErr)
+		}
+		var domain struct {
+			Disks []struct {
+				Source struct {
+					File string `xml:"file,attr"`
+				} `xml:"source"`
+			} `xml:"devices>disk"`
+		}
+		if err := xml.Unmarshal(raw, &domain); err != nil {
+			return err
+		}
+		allowed := map[string]bool{filepath.Clean(filepath.Join(d.imagesDir(), name+".qcow2")): true}
+		if inst.Image != nil {
+			for _, p := range []string{inst.Image.Path, inst.Image.ExtraPath} {
+				if p != "" {
+					allowed[filepath.Clean(p)] = true
+				}
+			}
+		}
+		for _, disk := range domain.Disks {
+			p := disk.Source.File
+			if allowed[filepath.Clean(p)] {
+				if err := ManagedImagePath(d.dataDir, p); err != nil {
+					return fmt.Errorf("unsafe owned volume: %w", err)
+				}
+				volumes = append(volumes, p)
+			}
+		}
 		if err := d.HardStop(ctx, inst); err != nil {
 			return err
 		}
@@ -182,7 +230,16 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 		if err := requireStopped(ctx, d, inst); err != nil {
 			return err
 		}
-		if err := run(ctx, "virsh", "undefine", name, "--remove-all-storage", "--nvram"); err != nil && !contains(err.Error(), "not found") {
+		// Libvirt must never delete attached foreign disks as a side effect of undefine.
+		if err := run(ctx, "virsh", "undefine", name, "--nvram"); err != nil {
+			return err
+		}
+	}
+	for _, p := range volumes {
+		if err := ManagedImagePath(d.dataDir, p); err != nil {
+			return err
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -193,7 +250,12 @@ func (d *QEMU) Delete(ctx context.Context, inst *protocol.Instance) error {
 	_ = os.RemoveAll(d.snapshotDir(inst.ID))
 	// 独立网络宿主侧资源（owned 桥/路由/proxy ARP/防伪造链/所有权记录）
 	// 随硬删除一并回收；域不存在时也要按记录清理。
-	return cleanupDedicated(ctx, d.dataDir, inst.ID)
+	if err := cleanupDedicated(ctx, d.dataDir, inst.ID); err != nil {
+		return err
+	}
+	// AGT-F7: return the persisted NAT slot to the pool; without this the
+	// 140-slot managed range leaks on every delete until exhaustion.
+	return releaseNATAllocation(d.dataDir, d.Name(), inst.ID)
 }
 
 func (d *QEMU) Start(ctx context.Context, inst *protocol.Instance) error {
@@ -607,29 +669,29 @@ func (d *QEMU) unreserveNATIP(ctx context.Context, mac, ip string) {
 // 永远等不到匹配的客户端，实例就拿不到保留 IP。这里以 domiflist 查到的
 // 实际 MAC 为权威改写保留条目，并把真实 MAC/保留 IP 回填进 inst.Network，
 // 由上层同步回主控。域未定义时直接返回（创建流程自己会做首次保留）。
-func (d *QEMU) EnsureNATIdentity(ctx context.Context, inst *protocol.Instance) {
+func (d *QEMU) EnsureNATIdentity(ctx context.Context, inst *protocol.Instance) error {
 	if NormalizeNetworkMode(inst.Network.Mode) != NetworkModeNat {
-		return
+		return nil
 	}
 	name := resourceName("qemu", inst)
 	if !d.exists(ctx, name) {
-		return
+		return nil
 	}
 	out, err := output(ctx, "virsh", "domiflist", name)
 	if err != nil {
-		return
+		return nil
 	}
 	ifaces := parseQEMUInterfaces(string(out))
 	if len(ifaces) == 0 {
-		return
+		return nil
 	}
 	actualMAC := strings.ToLower(ifaces[0].MAC)
 	if _, parseErr := net.ParseMAC(actualMAC); parseErr != nil {
-		return
+		return nil
 	}
-	reservedIP, _ := natSlotIP(inst)
-	if reservedIP == "" {
-		return
+	reservedIP, allocationErr := allocateNATIP(ctx, d.dataDir, d.Name(), "virbr0", inst)
+	if allocationErr != nil {
+		return allocationErr
 	}
 	// DB 里 MAC 可能为空：此时按派生 MAC 反查旧保留条目一并清理。
 	oldMAC := strings.ToLower(strings.TrimSpace(inst.Network.MAC))
@@ -638,7 +700,7 @@ func (d *QEMU) EnsureNATIdentity(ctx context.Context, inst *protocol.Instance) {
 	}
 	oldIP := strings.Split(inst.Network.IPv4, "/")[0]
 	if oldMAC == actualMAC && oldIP == reservedIP {
-		return
+		return nil
 	}
 	if oldMAC != actualMAC {
 		d.unreserveNATIP(ctx, oldMAC, oldIP)
@@ -647,12 +709,12 @@ func (d *QEMU) EnsureNATIdentity(ctx context.Context, inst *protocol.Instance) {
 		d.unreserveNATIP(ctx, actualMAC, oldIP)
 	}
 	if !d.reserveNATIP(ctx, actualMAC, reservedIP) {
-		log.Printf("NAT 实例 %d 写入 DHCP 保留失败: MAC %s → %s", inst.ID, actualMAC, reservedIP)
-		return
+		return fmt.Errorf("NAT DHCP reservation failed")
 	}
 	inst.Network.MAC = actualMAC
 	inst.Network.IPv4 = reservedIP
 	log.Printf("NAT 实例 %d 身份已对账: 网卡 MAC %s ↔ 保留 IP %s", inst.ID, actualMAC, reservedIP)
+	return nil
 }
 
 // SetRootPassword 经 guest agent 设置 root 密码。客户机的
@@ -930,7 +992,7 @@ func domainXML(name string, inst *protocol.Instance, diskPath, isoPath string) s
       <model type='vga' vram='16384' heads='1' primary='yes'/>
     </video>
     <memballoon model='virtio'/>
-    <graphics type='vnc' autoport='yes' listen='0.0.0.0'/>
+    <graphics type='vnc' autoport='yes' listen='127.0.0.1'/>
     <console type='pty'>
       <target type='serial' port='0'/>
     </console>

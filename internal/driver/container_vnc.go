@@ -166,8 +166,9 @@ func startXterm(display, name string, argv []string, env []string) error {
 }
 
 func startX11VNC(display string, port int, env []string) error {
+	// Bind the passwordless console locally so only the authenticated proxy can reach it.
 	x11vnc := exec.Command("x11vnc", "-display", ":"+display,
-		"-rfbport", strconv.Itoa(port), "-nopw", "-shared", "-forever", "-quiet",
+		"-rfbport", strconv.Itoa(port), "-localhost", "-nopw", "-shared", "-forever", "-quiet",
 		"-noxrecord", "-noxdamage")
 	x11vnc.Env = env
 	x11vnc.SysProcAttr = setpgidAttr()
