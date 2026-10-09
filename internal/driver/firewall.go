@@ -29,11 +29,7 @@ func FirewallChainName(id uint) string {
 // guestFirewallIP 解析防火墙规则要匹配的实例地址：NAT 模式用静态保留
 // IP，其余模式用显式配置的 IPv4。
 func guestFirewallIP(inst *protocol.Instance) string {
-	if NormalizeNetworkMode(inst.Network.Mode) == NetworkModeNat {
-		if ip, _ := natSlotIP(inst); ip != "" {
-			return ip
-		}
-	}
+	// Only an assigned or observed address is authoritative; a modulo-derived address can belong to another guest.
 	if v := strings.TrimSpace(inst.Network.IPv4); v != "" {
 		return strings.Split(v, "/")[0]
 	}
