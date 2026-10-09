@@ -29,22 +29,25 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
-    name: Build and publish artifacts
+  build:
+    name: Build verified release payload
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      name: ${{ steps.meta.outputs.name || steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          fetch-tags: true
+          persist-credentials: false
 
-      # Trigger sources differ, so normalize first; later steps only read
-      # these outputs. Inputs travel through env instead of being spliced
-      # into the script, so quotes in an input cannot break the command.
       - name: Resolve release metadata
         id: meta
         env:
@@ -61,6 +64,7 @@ jobs:
           # against typos early.
           # case takes the first matching pattern and "*" eats suffixes like
           # "-rc.1", so the suffixed (pre-release) pattern must come first.
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "Invalid release tag" >&2; exit 1; }
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*-*)
               prerelease=true ;;
@@ -82,62 +86,94 @@ jobs:
           echo "Releasing $tag (prerelease: $prerelease)"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
 
-      # Categorize commits by Conventional Commits prefix via the shared
-      # script. Runs before the build: broken history should fail fast,
-      # not after ten minutes of compiling.
       - name: Generate release notes
         env:
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
           TAG: ${{ steps.meta.outputs.tag }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           # gh api needs a token to read the release list (prerelease flags).
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+          if [ "$PRERELEASE" = "true" ]; then
             bash scripts/release_notes.sh "$TAG" any > release-notes.md
           else
             bash scripts/release_notes.sh "$TAG" stable > release-notes.md
           fi
-          cat release-notes.md
+          test -f release-notes.md
 
-      - name: Build all platforms
-        run: |
-          mkdir -p bin
-          # native
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/virtualis-agent ./cmd/agent
-          ls -lh bin/virtualis-agent
-          # cross
-          for p in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
-            GOOS="${p%/*}"; GOARCH="${p#*/}"; EXT=""; [ "$GOOS" = "windows" ] && EXT=".exe"
-            OUT="bin/virtualis-agent-${GOOS}-${GOARCH}${EXT}"
-            echo "-> $GOOS/$GOARCH"
-            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "-s -w" -o "$OUT" ./cmd/agent
-            ls -lh "$OUT"
-          done
-          ls -lh bin/
-
-      - name: Generate checksums
-        run: |
-          cd bin
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
-
-      # When the tag does not exist yet, this step creates it on
-      # target_commitish, so manual runs do not need a pre-pushed tag.
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ steps.meta.outputs.prerelease }}
-          body_path: release-notes.md
-          files: |
-            bin/*
-            bin/SHA256SUMS
+          go-version: 1.27.2
+          cache: true
+
+      - name: Build required binaries
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CGO_ENABLED: '0'
+          VERSION: ${{ steps.meta.outputs.tag }}
+          AGENT_SHA: ${{ steps.agent.outputs.sha }}
+        run: |
+          mkdir -p bin/release
+          go mod verify
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"
+            suffix=""; [ "$os" != windows ] || suffix=.exe
+            GOOS="$os" GOARCH="$arch" go build -mod=readonly -trimpath -ldflags "-s -w" -o "bin/release/virtualis-agent-$os-$arch$suffix" ./cmd/agent
+            test -s "bin/release/virtualis-agent-$os-$arch$suffix"
+          done
+
+      - name: Record release inputs and checksums
+        env:
+          FRONTEND_REF: ${{ inputs.frontend_ref || 'main' }}
+          FRONTEND_SHA: ${{ steps.frontend.outputs.sha }}
+          AGENT_REF: ${{ inputs.agent_ref || 'main' }}
+          AGENT_SHA: ${{ steps.agent.outputs.sha }}
+        run: |
+          python3 .github/scripts/release_manifest.py bin/release/manifest.json
+          cd bin/release
+          sha256sum * > checksums.txt
+          cp checksums.txt SHA256SUMS
+
+      - name: Upload immutable build payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-payload
+          if-no-files-found: error
+          path: |
+            bin/release/*
+            release-notes.md
+
+  publish:
+    name: Publish without running source or dependency code
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build payload
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: release-payload
+          path: .release
+
+      - name: Check complete payload
+        run: |
+          test -s .release/bin/release/manifest.json
+          test -f .release/release-notes.md
+          cd .release/bin/release
+          sha256sum --strict -c checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: ${{ needs.build.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.build.outputs.prerelease }}
+          fail_on_unmatched_files: true
+          body_path: .release/release-notes.md
+          files: .release/bin/release/*
