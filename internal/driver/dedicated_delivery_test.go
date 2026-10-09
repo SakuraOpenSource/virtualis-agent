@@ -101,12 +101,18 @@ func TestQEMUCreateDedicatedAttachesOwnedBridgeAndPersistentStaticGuest(t *testi
 		}
 		return baseRunner(ctx, name, a...)
 	})
-	disk := t.TempDir() + "/disk.qcow2"
+	// AGT-F4: Create must only attach disks under the agent-managed images
+	// directory; the fixture therefore stages the disk inside dataDir/images.
+	dataDir := t.TempDir()
+	disk := dataDir + "/images/disk.qcow2"
+	if e := os.MkdirAll(dataDir+"/images", 0755); e != nil {
+		t.Fatal(e)
+	}
 	if e := os.WriteFile(disk, []byte("offline-image-fixture"), 0600); e != nil {
 		t.Fatal(e)
 	}
 	inst := &protocol.Instance{ID: 8, Name: "routed", Network: protocol.NetworkConfig{Mode: "dedicated", Bridge: "eth0", IPv4: "192.0.2.20/24", Gateway: "192.0.2.1"}, Image: &protocol.Image{Path: disk, Type: "disk"}}
-	if e := NewQEMUWithDataDir(t.TempDir()).Create(ctx, inst); e != nil {
+	if e := NewQEMUWithDataDir(dataDir).Create(ctx, inst); e != nil {
 		t.Fatal(e)
 	}
 	if !strings.Contains(xml, "source bridge='vb8'") || strings.Contains(xml, "type='direct'") || strings.Contains(xml, "network='default'") {

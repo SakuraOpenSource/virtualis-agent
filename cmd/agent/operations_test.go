@@ -19,6 +19,7 @@ type testDriver struct {
 	status     func(context.Context, *protocol.Instance) (string, error)
 	export     func(context.Context, *protocol.Instance, string) error
 	importFn   func(context.Context, *protocol.Instance, string) error
+	replaceFn  func(context.Context, *protocol.Instance, *protocol.Instance, string) error
 	deleteFn   func(context.Context, *protocol.Instance) error
 	validate   func(context.Context, *protocol.Instance, string) error
 	resize     func(context.Context, *protocol.Instance, protocol.InstanceSpec, *protocol.NetworkConfig) error
@@ -52,6 +53,10 @@ func (d *testDriver) Delete(ctx context.Context, i *protocol.Instance) error {
 		return d.deleteFn(ctx, i)
 	}
 	return nil
+}
+func (d *testDriver) ReplaceImport(ctx context.Context, original, incoming *protocol.Instance, path string) error {
+	if d.replaceFn != nil { return d.replaceFn(ctx, original, incoming, path) }
+	return d.Import(ctx, incoming, path)
 }
 func (*testDriver) ConfigureNetwork(context.Context, *protocol.Instance) error { return nil }
 func (d *testDriver) Network(ctx context.Context, i *protocol.Instance) (protocol.NetworkStatus, error) {

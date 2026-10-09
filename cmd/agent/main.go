@@ -36,6 +36,7 @@ type agentServer struct {
 	name      string
 	version   string
 	dataDir   string
+	allowInsecure bool
 	registry  *driver.Registry
 	mu        sync.RWMutex
 	instances map[uint]protocol.Instance
@@ -70,7 +71,7 @@ func (s *agentServer) applyBootReady(instance *protocol.Instance) {
 }
 
 func newAgentServer(token, name, version, dataDir string) *agentServer {
-	return &agentServer{
+	s := &agentServer{
 		token:     token,
 		name:      name,
 		version:   version,
@@ -80,6 +81,8 @@ func newAgentServer(token, name, version, dataDir string) *agentServer {
 		metrics:   make(map[uint]protocol.Metrics),
 		bootReady: make(map[uint]bool),
 	}
+	s.loadOwnedInstances()
+	return s
 }
 
 func (s *agentServer) handler() http.Handler {
@@ -141,6 +144,16 @@ func (s *agentServer) auth(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "agent token 无效")
 			return
 		}
+		limit := int64(1 << 20)
+		if r.URL.Path == "/api/instances" || strings.HasSuffix(r.URL.Path, "/power") || strings.HasSuffix(r.URL.Path, "/import") {
+			limit = maxImageSize + (1 << 20)
+		}
+		// Bound the entire body before multipart parsing can spill anything to disk.
+		if r.ContentLength > limit {
+			writeError(w, http.StatusRequestEntityTooLarge, "request exceeds maximum size")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -194,6 +207,11 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "instance id/name required")
 		return
 	}
+	// Host paths are output metadata, not authority to attach another host file.
+	if instance.Image != nil && (instance.Image.Path != "" || instance.Image.ExtraPath != "") {
+		writeError(w, http.StatusBadRequest, "image paths must be supplied as uploads, not host paths")
+		return
+	}
 	lease, ok := s.tryOperation(instance.ID)
 	if !ok {
 		writeError(w, http.StatusConflict, "instance operation in progress")
@@ -201,6 +219,10 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.done()
 	r = r.WithContext(context.WithValue(r.Context(), leaseKey{}, lease))
+	if _, err := s.ownedInstance(instance.ID); err == nil || !os.IsNotExist(err) {
+		writeError(w, http.StatusConflict, "instance identity already registered or ownership cannot be verified")
+		return
+	}
 	if instance.Image == nil && upload != nil {
 		instance.Image = &protocol.Image{OriginalName: filename, Driver: instance.Driver, Type: "disk"}
 	}
@@ -236,6 +258,10 @@ func (s *agentServer) createInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	instance.Driver = d.Name()
+	if err := s.saveOwnedInstance(instance); err != nil {
+		writeError(w, http.StatusInternalServerError, "created runtime retained; ownership persistence failed")
+		return
+	}
 	// Incus 的 launch 创建即运行；按真实状态回写，别想当然。
 	if real, err := d.Status(r.Context(), &instance); err == nil {
 		instance.Status = real
@@ -331,13 +357,12 @@ func (s *agentServer) instanceRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id uint) {
-	instance, err := s.requestInstance(r, id)
-	if err != nil {
-		instance, err = s.storedInstance(id)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+	requested, requestErr := s.requestInstance(r, id)
+	instance, err := s.ownedInstance(id)
+	// A replayed or forged wire identity must not authorize deletion of host storage.
+	if err != nil || (requestErr == nil && (requested.Name != instance.Name || requested.Driver != instance.Driver)) {
+		writeError(w, http.StatusConflict, "instance identity is not registered on this agent")
+		return
 	}
 	d, err := s.registry.Resolve(r.Context(), instance.Driver)
 	if err != nil {
@@ -348,11 +373,13 @@ func (s *agentServer) deleteInstance(w http.ResponseWriter, r *http.Request, id 
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if err := os.Remove(s.ownershipPath(id)); err != nil {
+		writeError(w, http.StatusInternalServerError, "runtime removed; ownership cleanup failed")
+		return
+	}
 	driver.ClearNATRules(r.Context(), id)
 	driver.ClearFirewall(r.Context(), id)
-	if instance.Image != nil && instance.Image.Path != "" {
-		_ = os.Remove(instance.Image.Path)
-	}
+	// Drivers remove only their own volumes, never a path supplied by the caller.
 	s.mu.Lock()
 	delete(s.instances, id)
 	delete(s.bootReady, id)
@@ -379,6 +406,16 @@ func (s *agentServer) powerInstance(w http.ResponseWriter, r *http.Request, id u
 	if instance.ID != id {
 		writeError(w, http.StatusBadRequest, "instance id mismatch")
 		return
+	}
+	if instance.Image != nil && (instance.Image.Path != "" || instance.Image.ExtraPath != "") {
+		stored, storedErr := s.storedInstance(id)
+		if storedErr != nil || stored.Name != instance.Name || stored.Driver != instance.Driver || stored.Image == nil ||
+			instance.Image.Path != stored.Image.Path || instance.Image.ExtraPath != stored.Image.ExtraPath {
+			writeError(w, http.StatusBadRequest, "unregistered host image path")
+			return
+		}
+		image := *stored.Image
+		instance.Image = &image
 	}
 	if upload != nil {
 		localPath, saveErr := s.saveImage(upload, filename)
@@ -1232,6 +1269,7 @@ type registration struct {
 }
 
 func (s *agentServer) register(ctx context.Context, master, endpoint string) error {
+	if err := validateMasterURL(master,s.allowInsecure); err != nil { return err }
 	items := s.registry.Capabilities(ctx)
 	drivers := make([]string, 0, len(items))
 	primary := ""
@@ -1332,7 +1370,8 @@ func localAddress(master string) string {
 func main() {
 	var (
 		master    = flag.String("master", "", "主控地址，例如 http://MASTER:8080")
-		token     = flag.String("token", "", "主控生成的接入 token")
+		tokenFile = flag.String("token-file", "", "Private file containing the master-issued token")
+		allowInsecure = flag.Bool("allow-insecure", false, "Allow non-loopback HTTP and accept plaintext credential exposure")
 		name      = flag.String("name", "", "被控名称")
 		listen    = flag.String("listen", ":8081", "被控 RPC 监听地址")
 		advertise = flag.String("advertise", "", "主控可访问的被控地址，例如 http://10.0.0.2:8081")
@@ -1340,11 +1379,14 @@ func main() {
 		version   = flag.String("version", "dev", "版本")
 	)
 	flag.Parse()
-	if strings.TrimSpace(*master) == "" || strings.TrimSpace(*token) == "" {
-		fmt.Println("用法: virtualis-agent --master http://MASTER:8080 --token TOKEN --name node-01 [--advertise http://AGENT:8081]")
+	if strings.TrimSpace(*master) == "" || strings.TrimSpace(*tokenFile) == "" {
+		fmt.Println("Usage: virtualis-agent --master https://MASTER --token-file /etc/virtualis-agent/token --name node-01")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
+	token, err := loadAgentToken(*tokenFile)
+	if err != nil { log.Fatal(err) }
+	if err := validateMasterURL(*master,*allowInsecure); err != nil { log.Fatal(err) }
 	if *name == "" {
 		*name, _ = os.Hostname()
 		if *name == "" {
@@ -1357,7 +1399,8 @@ func main() {
 	driver.PrepareDiskDir(*dataDir)
 	// 修复旧版本以 0600 落盘的存量镜像，升级重启后即可直接开机。
 	driver.PrepareAllDiskFiles(*dataDir)
-	state := newAgentServer(*token, *name, *version, *dataDir)
+	state := newAgentServer(token, *name, *version, *dataDir)
+	state.allowInsecure = *allowInsecure
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatalf("监听失败: %v", err)

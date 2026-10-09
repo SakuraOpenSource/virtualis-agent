@@ -53,6 +53,10 @@ func (d *Incus) CreateSnapshot(ctx context.Context, inst *protocol.Instance, nam
 	return 0, run(ctx, d.cli(), "snapshot", "create", resourceName(d.Name(), inst), name, "--no-expiry")
 }
 func (d *Incus) RestoreSnapshot(ctx context.Context, inst *protocol.Instance, name string) error {
+	// Older nodes must not fall back to restoring guest config along with the disk.
+	supported, err := d.snapshotDiskOnlyCapable(ctx)
+	if err != nil { return err }
+	if !supported { return fmt.Errorf("Incus version is too old: requires %s",diskOnlyRestoreExtension) }
 	if !ValidSnapshotName(name) {
 		return fmt.Errorf("快照名称无效")
 	}
