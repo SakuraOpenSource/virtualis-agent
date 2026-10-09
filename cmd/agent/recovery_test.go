@@ -8,12 +8,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/SakuraOpenSource/virtualis-agent/internal/driver"
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
 
@@ -45,65 +42,7 @@ func TestReplaceValidatesBeforeDeletingOriginal(t *testing.T) {
 		t.Fatalf("validation must precede destructive work: code=%d deletes=%d exports=%d %s", rec.Code, deletes, exports, rec.Body.String())
 	}
 }
-func TestReplaceRollbackRestoresOriginalMetadataAndReadiness(t *testing.T) {
-	calls := 0
-	d := &testDriver{importFn: func(ctx context.Context, inst *protocol.Instance, path string) error {
-		calls++
-		if calls == 1 {
-			inst.Spec.CPU = 9
-			return errors.New("incoming failure")
-		}
-		if ctx.Err() != nil {
-			t.Fatal("rollback inherited cancelled context")
-		}
-		inst.Image = &protocol.Image{Path: "actual-restored-disk"}
-		return nil
-	}}
-	s := agentForTest(t, d)
-	old := testInstance(1)
-	old.Spec.CPU = 2
-	old.SSHReady = true
-	s.instances[1] = old
-	s.markBootReady(1, true)
-	incoming := testInstance(1)
-	incoming.Spec.CPU = 4
-	rec := importRequest(s, incoming, true)
-	if rec.Code != 502 {
-		t.Fatal(rec.Code, rec.Body.String())
-	}
-	got, _ := s.storedInstance(1)
-	if got.Spec.CPU != 2 || got.Status != driver.StatusStopped || !s.bootReadyOf(1) || got.Image == nil || got.Image.Path != "actual-restored-disk" {
-		t.Fatalf("rollback cache not restored: %+v ready=%v", got, s.bootReadyOf(1))
-	}
-	entries, _ := filepath.Glob(filepath.Join(s.dataDir, "rollback-*"))
-	if len(entries) != 0 {
-		t.Fatalf("successful rollback leaked archive %v", entries)
-	}
-}
-func TestReplaceRollbackFailureRetainsArchiveWithoutGenericDelete(t *testing.T) {
-	deletes := 0
-	d := &testDriver{deleteFn: func(context.Context, *protocol.Instance) error { deletes++; return nil }, importFn: func(context.Context, *protocol.Instance, string) error { return errors.New("cannot import") }}
-	s := agentForTest(t, d)
-	s.instances[1] = testInstance(1)
-	s.markBootReady(1, true)
-	rec := importRequest(s, testInstance(1), true)
-	if rec.Code != 502 || !strings.Contains(rec.Body.String(), "rollback failed") {
-		t.Fatal(rec.Code, rec.Body.String())
-	}
-	archives, _ := filepath.Glob(filepath.Join(s.dataDir, "rollback-*", "backup*"))
-	if len(archives) != 1 {
-		t.Fatalf("recovery archive lost: %v", archives)
-	}
-	if b, err := os.ReadFile(archives[0]); err != nil || string(b) != "original" {
-		t.Fatal("invalid retained recovery archive", err)
-	}
-	if deletes != 1 {
-		t.Fatalf("failed import triggered generic delete (could destroy unrelated target): %d", deletes)
-	}
-	if s.bootReadyOf(1) {
-		t.Fatal("unrecoverable failure retained readiness")
-	}
-}
+
 func TestImportClearsReadinessWithoutResettingPassword(t *testing.T) {
 	d := &testDriver{importFn: func(_ context.Context, inst *protocol.Instance, _ string) error {
 		if inst.RootPassword != "" {

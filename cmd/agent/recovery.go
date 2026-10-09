@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/SakuraOpenSource/virtualis-agent/internal/driver"
 	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
@@ -149,53 +150,34 @@ func (s *agentServer) importInstance(w http.ResponseWriter, r *http.Request, id 
 			writeError(w, 409, "stop instance before restoring backup")
 			return
 		}
-		rollbackDir, err := os.MkdirTemp(s.dataDir, "rollback-*")
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
-		rollbackPath := filepath.Join(rollbackDir, "backup")
-		if err := recovery.Export(r.Context(), &original, rollbackPath); err != nil {
-			os.RemoveAll(rollbackDir)
-			writeError(w, 502, err.Error())
-			return
-		}
-		if err := d.Delete(r.Context(), &original); err != nil {
-			writeError(w, 502, "original backup retained at "+rollbackPath+": "+err.Error())
-			return
-		}
-		if err := importVerified(r.Context(), d, recovery, &inst, path); err != nil {
-			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Hour)
-			defer cancel()
-			// A safe Import cleans only resources it owns. Never call generic
-			// Delete here: a failed import may mean an existing target conflict.
-			rollbackErr := recovery.Import(rollbackCtx, &original, rollbackPath)
-			if rollbackErr == nil {
-				var status string
-				status, rollbackErr = d.Status(rollbackCtx, &original)
-				if rollbackErr == nil && status != driver.StatusStopped {
-					rollbackErr = fmt.Errorf("rollback runtime is not stopped: %s", status)
-				}
-			}
-			if rollbackErr != nil {
-				original.Status, original.SSHReady = "error", false
-				s.storeRecovered(original, false)
-				writeError(w, 502, fmt.Sprintf("restore failed: %v; rollback failed: %v; recovery archive: %s", err, rollbackErr, rollbackPath))
-				return
-			}
-			original.Status = driver.StatusStopped
-			s.storeRecovered(original, originalReady)
-			os.RemoveAll(rollbackDir)
-			writeError(w, 502, "restore failed; original instance recovered: "+err.Error())
-			return
-		}
-		os.RemoveAll(rollbackDir)
+        staged, ok := d.(driver.ReplacementImporter)
+        if !ok {
+            writeError(w, 400, "driver does not support non-destructive staged replacement")
+            return
+        }
+        if err := staged.ReplaceImport(r.Context(), &original, &inst, path); err != nil {
+            original.Status = driver.StatusStopped
+            ready := originalReady
+            var uncertain *driver.ReplacementError
+            if errors.As(err, &uncertain) && uncertain.Uncertain {
+                original.Status, ready = "error", false
+            }
+            s.storeRecovered(original, ready)
+            // Driver errors can contain host paths; recovery details stay in the node log.
+            log.Printf("instance %d staged replacement failed: %v", id, err)
+            writeError(w, 502, "staged restore failed; original data retained on agent; operator recovery may be required")
+            return
+        }
 	} else if err := importVerified(r.Context(), d, recovery, &inst, path); err != nil {
 		writeError(w, 502, err.Error())
 		return
 	}
 	inst.Status = driver.StatusStopped
 	inst.RootPassword = ""
+	if err := s.saveOwnedInstance(inst); err != nil {
+		writeError(w, 500, "imported runtime retained; ownership persistence failed")
+		return
+	}
 	s.storeRecovered(inst, false)
 	writeJSON(w, 200, map[string]any{"instance": inst})
 }

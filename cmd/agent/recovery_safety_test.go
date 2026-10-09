@@ -3,17 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
-	"github.com/SakuraOpenSource/virtualis-agent/internal/driver"
-	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/SakuraOpenSource/virtualis-agent/internal/protocol"
 )
 
 func TestReplaceRefusesStoredIdentityChange(t *testing.T) {
@@ -28,30 +26,7 @@ func TestReplaceRefusesStoredIdentityChange(t *testing.T) {
 		t.Fatal("replacement deleted different stored identity", r.Code, deletes, r.Body.String())
 	}
 }
-func TestReplaceDoesNotDiscardRollbackBeforeStoppedVerification(t *testing.T) {
-	imported := false
-	d := &testDriver{status: func(context.Context, *protocol.Instance) (string, error) {
-		if imported {
-			return driver.StatusRunning, nil
-		}
-		return driver.StatusStopped, nil
-	}, importFn: func(context.Context, *protocol.Instance, string) error {
-		if imported {
-			return errors.New("target exists")
-		}
-		imported = true
-		return nil
-	}}
-	s := agentForTest(t, d)
-	r := importRequest(s, testInstance(1), true)
-	if r.Code != 502 {
-		t.Fatal("unverified import reported success", r.Code, r.Body.String())
-	}
-	p, _ := filepath.Glob(filepath.Join(s.dataDir, "rollback-*", "backup"))
-	if len(p) != 1 {
-		t.Fatal("original archive removed before verification", p)
-	}
-}
+
 func TestSnapshotRestoreInvalidatesCachedReadiness(t *testing.T) {
 	s := agentForTest(t, &testDriver{})
 	i := testInstance(1)
