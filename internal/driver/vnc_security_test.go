@@ -44,7 +44,7 @@ func TestQEMUVNCXMLRestrictsConsoleToLoopback(t *testing.T) {
 	var domain struct {
 		Devices struct {
 			Graphics []struct {
-				Type string `xml:"type,attr"`
+				Type   string `xml:"type,attr"`
 				Listen string `xml:"listen,attr"`
 			} `xml:"graphics"`
 		} `xml:"devices"`

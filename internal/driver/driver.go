@@ -62,9 +62,9 @@ type Capability struct {
 	// FirewallPolicy 表示驱动支持事务化默认策略下发（iptables-restore 单事务
 	// 替换 + 失败回滚）。主控在实例携带 firewall_policy 时会校验该位，旧被控
 	// 缺字段即 false，创建被拒绝而不是静默忽略默认拒绝语义。
-	FirewallPolicy bool `json:"firewall_policy"`
-	SnapshotDiskOnlyRestore bool `json:"snapshot_disk_only_restore"`
-	RecoveryError string `json:"recovery_error,omitempty"`
+	FirewallPolicy          bool   `json:"firewall_policy"`
+	SnapshotDiskOnlyRestore bool   `json:"snapshot_disk_only_restore"`
+	RecoveryError           string `json:"recovery_error,omitempty"`
 }
 
 // policyCapable 由实现 FirewallPolicy 事务下发的驱动声明。incus/qemu 均已实现；
@@ -162,10 +162,14 @@ func (r *Registry) Capabilities(ctx context.Context) []Capability {
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		err := d.Probe(probeCtx)
-		if capability, ok := d.(interface{snapshotDiskOnlyCapable(context.Context)(bool,error)}); ok && err == nil {
+		if capability, ok := d.(interface {
+			snapshotDiskOnlyCapable(context.Context) (bool, error)
+		}); ok && err == nil {
 			supported, recoveryErr := capability.snapshotDiskOnlyCapable(probeCtx)
 			item.SnapshotDiskOnlyRestore = supported
-			if recoveryErr != nil { item.RecoveryError = recoveryErr.Error() }
+			if recoveryErr != nil {
+				item.RecoveryError = recoveryErr.Error()
+			}
 		}
 		cancel()
 		item.Available = err == nil

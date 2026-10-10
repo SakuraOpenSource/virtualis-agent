@@ -32,16 +32,16 @@ import (
 const maxImageSize = int64(64 << 30)
 
 type agentServer struct {
-	token     string
-	name      string
-	version   string
-	dataDir   string
+	token         string
+	name          string
+	version       string
+	dataDir       string
 	allowInsecure bool
-	registry  *driver.Registry
-	mu        sync.RWMutex
-	instances map[uint]protocol.Instance
-	busy      map[uint]bool
-	metrics   map[uint]protocol.Metrics
+	registry      *driver.Registry
+	mu            sync.RWMutex
+	instances     map[uint]protocol.Instance
+	busy          map[uint]bool
+	metrics       map[uint]protocol.Metrics
 	// bootReady 记录创建/重装后的首次 root 密码注入是否已完成；重启 agent
 	// 后状态丢失，主控的下一次“配置网络”会重新校准，这里只求真实乐观。
 	bootReady map[uint]bool
@@ -1269,7 +1269,9 @@ type registration struct {
 }
 
 func (s *agentServer) register(ctx context.Context, master, endpoint string) error {
-	if err := validateMasterURL(master,s.allowInsecure); err != nil { return err }
+	if err := validateMasterURL(master, s.allowInsecure); err != nil {
+		return err
+	}
 	items := s.registry.Capabilities(ctx)
 	drivers := make([]string, 0, len(items))
 	primary := ""
@@ -1369,14 +1371,14 @@ func localAddress(master string) string {
 
 func main() {
 	var (
-		master    = flag.String("master", "", "主控地址，例如 http://MASTER:8080")
-		tokenFile = flag.String("token-file", "", "Private file containing the master-issued token")
+		master        = flag.String("master", "", "主控地址，例如 http://MASTER:8080")
+		tokenFile     = flag.String("token-file", "", "Private file containing the master-issued token")
 		allowInsecure = flag.Bool("allow-insecure", false, "Allow non-loopback HTTP and accept plaintext credential exposure")
-		name      = flag.String("name", "", "被控名称")
-		listen    = flag.String("listen", ":8081", "被控 RPC 监听地址")
-		advertise = flag.String("advertise", "", "主控可访问的被控地址，例如 http://10.0.0.2:8081")
-		dataDir   = flag.String("data", "/var/lib/virtualis-agent", "被控数据目录")
-		version   = flag.String("version", "dev", "版本")
+		name          = flag.String("name", "", "被控名称")
+		listen        = flag.String("listen", ":8081", "被控 RPC 监听地址")
+		advertise     = flag.String("advertise", "", "主控可访问的被控地址，例如 http://10.0.0.2:8081")
+		dataDir       = flag.String("data", "/var/lib/virtualis-agent", "被控数据目录")
+		version       = flag.String("version", "dev", "版本")
 	)
 	flag.Parse()
 	if strings.TrimSpace(*master) == "" || strings.TrimSpace(*tokenFile) == "" {
@@ -1385,8 +1387,12 @@ func main() {
 		os.Exit(2)
 	}
 	token, err := loadAgentToken(*tokenFile)
-	if err != nil { log.Fatal(err) }
-	if err := validateMasterURL(*master,*allowInsecure); err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := validateMasterURL(*master, *allowInsecure); err != nil {
+		log.Fatal(err)
+	}
 	if *name == "" {
 		*name, _ = os.Hostname()
 		if *name == "" {

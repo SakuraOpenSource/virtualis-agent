@@ -9,9 +9,13 @@ import (
 
 func ManagedImagePath(dataDir, path string) error {
 	root, err := filepath.Abs(filepath.Join(dataDir, "images"))
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	absolute, err := filepath.Abs(path)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	relative, err := filepath.Rel(root, absolute)
 	if err != nil || relative == "." || filepath.Dir(relative) != "." || strings.ContainsAny(relative, `/\:`) || relative == ".." {
 		return fmt.Errorf("image is not a direct child of managed storage")

@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -150,24 +150,24 @@ func (s *agentServer) importInstance(w http.ResponseWriter, r *http.Request, id 
 			writeError(w, 409, "stop instance before restoring backup")
 			return
 		}
-        staged, ok := d.(driver.ReplacementImporter)
-        if !ok {
-            writeError(w, 400, "driver does not support non-destructive staged replacement")
-            return
-        }
-        if err := staged.ReplaceImport(r.Context(), &original, &inst, path); err != nil {
-            original.Status = driver.StatusStopped
-            ready := originalReady
-            var uncertain *driver.ReplacementError
-            if errors.As(err, &uncertain) && uncertain.Uncertain {
-                original.Status, ready = "error", false
-            }
-            s.storeRecovered(original, ready)
-            // Driver errors can contain host paths; recovery details stay in the node log.
-            log.Printf("instance %d staged replacement failed: %v", id, err)
-            writeError(w, 502, "staged restore failed; original data retained on agent; operator recovery may be required")
-            return
-        }
+		staged, ok := d.(driver.ReplacementImporter)
+		if !ok {
+			writeError(w, 400, "driver does not support non-destructive staged replacement")
+			return
+		}
+		if err := staged.ReplaceImport(r.Context(), &original, &inst, path); err != nil {
+			original.Status = driver.StatusStopped
+			ready := originalReady
+			var uncertain *driver.ReplacementError
+			if errors.As(err, &uncertain) && uncertain.Uncertain {
+				original.Status, ready = "error", false
+			}
+			s.storeRecovered(original, ready)
+			// Driver errors can contain host paths; recovery details stay in the node log.
+			log.Printf("instance %d staged replacement failed: %v", id, err)
+			writeError(w, 502, "staged restore failed; original data retained on agent; operator recovery may be required")
+			return
+		}
 	} else if err := importVerified(r.Context(), d, recovery, &inst, path); err != nil {
 		writeError(w, 502, err.Error())
 		return

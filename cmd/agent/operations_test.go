@@ -55,7 +55,9 @@ func (d *testDriver) Delete(ctx context.Context, i *protocol.Instance) error {
 	return nil
 }
 func (d *testDriver) ReplaceImport(ctx context.Context, original, incoming *protocol.Instance, path string) error {
-	if d.replaceFn != nil { return d.replaceFn(ctx, original, incoming, path) }
+	if d.replaceFn != nil {
+		return d.replaceFn(ctx, original, incoming, path)
+	}
 	return d.Import(ctx, incoming, path)
 }
 func (*testDriver) ConfigureNetwork(context.Context, *protocol.Instance) error { return nil }
