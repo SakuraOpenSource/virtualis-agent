@@ -26,7 +26,13 @@ func TestSetRootPasswordSSHDConfigRewriteIsIdempotentAndFormatRobust(t *testing.
 	}
 	var script string
 	ctx := WithCommandRunner(context.Background(), func(_ context.Context, name string, args ...string) ([]byte, error) {
-		if name == "incus" && len(args) > 3 && args[0] == "exec" && args[3] == "sh" && args[4] == "-c" {
+		// cli() falls back to the legacy "lxc" binary name when incus is not
+		// on PATH (CI runners have neither), so both names must be accepted
+		// or the capture never fires on CI. Capture ONLY the sshd_config
+		// rewrite exec: SetRootPassword issues several sh -c calls and a bare
+		// "last one wins" capture ends up holding the final pgrep probe, which
+		// would fail the assertion below even though the product is correct.
+		if (name == "incus" || name == "lxc") && len(args) > 5 && args[0] == "exec" && args[3] == "sh" && args[4] == "-c" && strings.Contains(args[5], "sshd_config") {
 			script = args[5]
 		}
 		return []byte("{}"), nil
